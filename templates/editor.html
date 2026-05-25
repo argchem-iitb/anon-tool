@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Redact - {{ filename }}</title>
+    <link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+    <!-- Header -->
+    <header id="header">
+        <div class="header-left">
+            <a href="/" class="back-link">&larr; Back</a>
+            <span class="file-label" title="{{ filename }}">{{ filename }}</span>
+        </div>
+        <div class="header-center">
+            <button id="prevPage" class="hdr-btn" disabled>&lsaquo;</button>
+            <span id="pageInfo">Page 1 / 1</span>
+            <button id="nextPage" class="hdr-btn" disabled>&rsaquo;</button>
+        </div>
+        <div class="header-right">
+            <button id="autoDetect" class="hdr-btn toggle-btn">Auto-Detect PII</button>
+            <button id="aiAnalyze" class="hdr-btn ai-btn">AI Analyze</button>
+            <span id="redactCount" class="badge-count">0 selected</span>
+            <button id="confirmAI" class="hdr-btn confirm-ai-btn hidden">Confirm AI Suggestions</button>
+            <button id="processBtn" class="hdr-btn process-btn" disabled>Process Redaction</button>
+        </div>
+    </header>
+
+    <!-- AI status bar -->
+    <div id="ai-status" class="ai-status hidden">
+        <div class="ai-status-inner">
+            <div class="spinner-small"></div>
+            <span id="ai-status-text">Analyzing with Gemini...</span>
+        </div>
+    </div>
+
+    <!-- Main layout -->
+    <div id="main">
+        <!-- PDF Viewer (all pages rendered vertically) -->
+        <div id="viewer-panel">
+            <div id="viewer-scroll">
+                <div id="viewer-container">
+                    <!-- Pages inserted dynamically by viewer.js -->
+                </div>
+            </div>
+            <div id="viewer-loading" class="loading-overlay">
+                <div class="spinner"></div>
+                <span>Loading pages...</span>
+            </div>
+        </div>
+
+        <!-- Sidebar -->
+        <div id="sidebar">
+            <div id="sidebar-header">
+                <input type="text" id="filterInput" placeholder="Filter text blocks..." readonly>
+                <div id="sidebar-stats"></div>
+            </div>
+
+            <!-- Drawing Info Panel (shown after metadata extraction) -->
+            <div id="drawing-info-panel" class="drawing-info-panel hidden">
+                <div class="drawing-info-header">
+                    <span>Drawing Information</span>
+                    <span id="drawing-id-badge" class="drawing-id-badge"></span>
+                </div>
+                <div class="drawing-info-fields">
+                    <label>Client Name
+                        <input type="text" id="meta-client" class="meta-input" readonly placeholder="Extracted from drawing...">
+                    </label>
+                    <label>Original Part ID
+                        <input type="text" id="meta-part-id" class="meta-input" readonly placeholder="Extracted from drawing...">
+                    </label>
+                    <label>Part Name / Title
+                        <input type="text" id="meta-part-name" class="meta-input" readonly placeholder="Extracted from drawing...">
+                    </label>
+                    <div class="meta-row">
+                        <label>Quantity
+                            <input type="text" id="meta-quantity" class="meta-input" readonly value="1">
+                        </label>
+                        <label>Material
+                            <input type="text" id="meta-material" class="meta-input" readonly placeholder="e.g., SS 304">
+                        </label>
+                    </div>
+                </div>
+                <div class="drawing-info-footer">
+                    <span class="drawing-info-status">Status: Under Process</span>
+                </div>
+            </div>
+
+            <ul id="block-list"></ul>
+        </div>
+    </div>
+
+    <!-- Download modal -->
+    <div id="download-modal" class="modal hidden">
+        <div class="modal-content">
+            <h3>Redaction Complete</h3>
+            <p id="modal-msg"></p>
+            <a id="download-link" class="hdr-btn process-btn" download>Download Redacted PDF</a>
+            <button id="modal-close" class="hdr-btn">Close</button>
+        </div>
+    </div>
+
+    <script>
+        // Inject backend data
+        window.FILE_ID = "{{ file_id }}";
+        window.FILE_NAME = "{{ filename }}";
+    </script>
+    <script src="/static/js/viewer.js"></script>
+    <script src="/static/js/sidebar.js"></script>
+    <script src="/static/js/sync.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

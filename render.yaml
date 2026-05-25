@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: pdf-redaction-tool
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # Single worker is REQUIRED: uploads and scan results live in process
+    # memory (FILE_REGISTRY / SCAN_CACHE). Multiple workers would not share
+    # that state, so a follow-up request could miss the uploaded file.
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 180
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.10.13"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false

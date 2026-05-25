@@ -1,0 +1,21 @@
+# Secrets — never commit
+service_account.json
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime storage
+uploads/
+output/
+
+# Scratch / test artifacts
+meta_raw.json
+meta_result.json
+remove_ids.json
+test_ids.json
+test_remove_ids.json
+t.json
+nul
+*.pdf
