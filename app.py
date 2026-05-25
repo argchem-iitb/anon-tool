@@ -690,15 +690,19 @@ def extract_metadata(file_id):
                 break
 
     # Generate the next Drawing ID from the spreadsheet
+    drawing_id_error = None
     try:
         drawing_id = generate_drawing_id()
     except Exception as e:
         drawing_id = "DI_ERROR"
+        drawing_id_error = f"{type(e).__name__}: {e}"
+        _log(f"[DRAWING_ID] ERROR: {drawing_id_error}")
 
     return jsonify({
         "drawing_id": drawing_id,
         "metadata": metadata,
         "meta_error": meta_error,
+        "drawing_id_error": drawing_id_error,
     })
 
 
