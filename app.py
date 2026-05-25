@@ -36,8 +36,9 @@ SCALE = RENDER_DPI / 72.0
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 os.makedirs(app.config["OUTPUT_FOLDER"], exist_ok=True)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyBAILWnbRky4goljaHt1SEfUfS68dUiFlM")
-genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # file_id -> {"filename": str, "path": str}
 FILE_REGISTRY = {}
