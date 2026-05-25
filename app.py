@@ -4,6 +4,30 @@ import shutil
 import uuid
 import math
 
+
+def _load_dotenv():
+    """Minimal .env loader for local dev (no external dependency).
+
+    On Render the vars come from the dashboard, so a missing .env is fine.
+    """
+    path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key, val = key.strip(), val.strip().strip('"').strip("'")
+                os.environ.setdefault(key, val)
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
 import fitz
 import google.generativeai as genai
 from flask import (
