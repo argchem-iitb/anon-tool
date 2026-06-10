@@ -64,10 +64,32 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# file_id -> {"filename": str, "path": str}
-FILE_REGISTRY = {}
+# ── Disk-backed registry so state survives worker/OOM restarts on free tier ──
+# file_id -> {"filename": str, "path": str, "drawing_id": str?}
+_REGISTRY_PATH = os.path.join(app.config["UPLOAD_FOLDER"], "_registry.json")
 
-# Cache scan results for AI analysis: file_id -> blocks list
+
+def _load_registry():
+    try:
+        with open(_REGISTRY_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _save_registry():
+    try:
+        tmp = _REGISTRY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(FILE_REGISTRY, fh)
+        os.replace(tmp, _REGISTRY_PATH)
+    except Exception as e:
+        _log(f"[REGISTRY] save failed: {e}")
+
+
+FILE_REGISTRY = _load_registry()
+
+# SCAN_CACHE is rebuildable from the PDF on demand — no need to persist.
 SCAN_CACHE = {}
 
 
@@ -548,6 +570,7 @@ def upload():
     f.save(save_path)
 
     FILE_REGISTRY[file_id] = {"filename": safe_name, "path": save_path}
+    _save_registry()
     return redirect(url_for("editor", file_id=file_id))
 
 
@@ -644,7 +667,11 @@ def extract_metadata(file_id):
     data = request.get_json()
     block_ids = set(data.get("block_ids", []))
 
-    blocks = SCAN_CACHE.get(file_id, [])
+    blocks = SCAN_CACHE.get(file_id)
+    if not blocks:
+        # Cache lost (worker restart) — rebuild from disk
+        _, _, blocks = _extract_blocks(info["path"])
+        SCAN_CACHE[file_id] = blocks
     removed_blocks = [b for b in blocks if b["id"] in block_ids and not b.get("is_image")]
 
     # Extract metadata via Gemini
@@ -753,7 +780,10 @@ def redact(file_id):
 
     # Step 2: Overlay "Mechximize" + Drawing ID on the title block
     if drawing_id and drawing_id != "DI_ERROR":
-        scan_blocks = SCAN_CACHE.get(file_id, [])
+        scan_blocks = SCAN_CACHE.get(file_id)
+        if not scan_blocks:
+            _, _, scan_blocks = _extract_blocks(info["path"])
+            SCAN_CACHE[file_id] = scan_blocks
         _overlay_new_labels(doc, redact_blocks, drawing_id,
                             scan_blocks=scan_blocks, metadata=metadata)
 
@@ -778,6 +808,7 @@ def redact(file_id):
     # Store drawing_id for download filename
     if drawing_id and drawing_id != "DI_ERROR":
         FILE_REGISTRY[file_id]["drawing_id"] = drawing_id
+        _save_registry()
 
     return jsonify({
         "status": "ok",
