@@ -1,8 +1,11 @@
 import os
+import io
 import json
 import shutil
 import uuid
 import math
+import zipfile
+import hashlib
 
 
 def _load_dotenv():
@@ -37,7 +40,7 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 from pii_patterns import scan_pii
-from sheets_integration import generate_drawing_id, append_drawing_row
+from sheets_integration import generate_drawing_id, append_or_update_drawing_row
 
 
 def _log(msg):
@@ -50,7 +53,7 @@ def _log(msg):
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(__file__), "uploads")
 app.config["OUTPUT_FOLDER"] = os.path.join(os.path.dirname(__file__), "output")
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB (ZIP batches)
 
 RENDER_DPI = 150
 SCALE = RENDER_DPI / 72.0
@@ -88,6 +91,57 @@ def _save_registry():
 
 
 FILE_REGISTRY = _load_registry()
+
+# ── Batch registry for ZIP uploads: batch_id -> {"name": str, "file_ids": [...]} ──
+_BATCH_REGISTRY_PATH = os.path.join(app.config["UPLOAD_FOLDER"], "_batches.json")
+
+
+def _load_batch_registry():
+    try:
+        with open(_BATCH_REGISTRY_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _save_batch_registry():
+    try:
+        tmp = _BATCH_REGISTRY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(BATCH_REGISTRY, fh)
+        os.replace(tmp, _BATCH_REGISTRY_PATH)
+    except Exception as e:
+        _log(f"[BATCH] save failed: {e}")
+
+
+BATCH_REGISTRY = _load_batch_registry()
+
+# ── Drawing store: cross-session memory keyed by PDF content hash ──
+# hash -> {"drawing_id", "metadata", "redact_block_ids", "manual_boxes", "filename"}
+# Lets reopening the SAME drawing reuse its Drawing ID and restore prior work
+# (survives new file_ids from re-uploads, since identity is the content hash).
+_DRAWINGS_PATH = os.path.join(app.config["UPLOAD_FOLDER"], "_drawings.json")
+
+
+def _load_drawing_store():
+    try:
+        with open(_DRAWINGS_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _save_drawing_store():
+    try:
+        tmp = _DRAWINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(DRAWING_STORE, fh)
+        os.replace(tmp, _DRAWINGS_PATH)
+    except Exception as e:
+        _log(f"[DRAWINGS] save failed: {e}")
+
+
+DRAWING_STORE = _load_drawing_store()
 
 # SCAN_CACHE is rebuildable from the PDF on demand — no need to persist.
 SCAN_CACHE = {}
@@ -553,6 +607,33 @@ def _overlay_new_labels(doc, redact_blocks, drawing_id, scan_blocks=None, metada
 
 # ──────────────────────────── pages ────────────────────────────
 
+def _hash_file(path):
+    """SHA-256 of a file, read in chunks (avoids loading big PDFs into memory)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _register_pdf(data_bytes, display_name, batch_id=None):
+    """Persist raw PDF bytes under a fresh file_id and register it."""
+    file_id = uuid.uuid4().hex[:12]
+    save_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{file_id}.pdf")
+    with open(save_path, "wb") as fh:
+        fh.write(data_bytes)
+    entry = {
+        "filename": display_name,
+        "path": save_path,
+        "redacted": False,
+        "hash": hashlib.sha256(data_bytes).hexdigest(),
+    }
+    if batch_id:
+        entry["batch_id"] = batch_id
+    FILE_REGISTRY[file_id] = entry
+    return file_id
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -561,15 +642,64 @@ def index():
 @app.route("/upload", methods=["POST"])
 def upload():
     f = request.files.get("pdf")
-    if not f or not f.filename.lower().endswith(".pdf"):
-        return "Please upload a valid PDF file.", 400
+    if not f or not f.filename:
+        return "Please upload a file.", 400
+
+    name_lower = f.filename.lower()
+
+    # ── ZIP: extract every PDF inside into a batch ──
+    if name_lower.endswith(".zip"):
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(f.read()))
+        except Exception:
+            return "Invalid or corrupt ZIP file.", 400
+
+        batch_id = uuid.uuid4().hex[:12]
+        file_ids = []
+        MAX_FILES = 200
+        for name in zf.namelist():
+            if len(file_ids) >= MAX_FILES:
+                break
+            if name.endswith("/") or "__MACOSX" in name:
+                continue
+            base = os.path.basename(name)
+            if not base or base.startswith(".") or not base.lower().endswith(".pdf"):
+                continue
+            try:
+                pdf_bytes = zf.read(name)
+            except Exception:
+                continue
+            if not pdf_bytes:
+                continue
+            display = secure_filename(base) or f"file_{len(file_ids) + 1}.pdf"
+            file_ids.append(_register_pdf(pdf_bytes, display, batch_id=batch_id))
+
+        if not file_ids:
+            return "No PDF files found in the ZIP.", 400
+
+        BATCH_REGISTRY[batch_id] = {
+            "name": secure_filename(f.filename) or "batch.zip",
+            "file_ids": file_ids,
+        }
+        _save_registry()
+        _save_batch_registry()
+        return redirect(url_for("batch_view", batch_id=batch_id))
+
+    # ── Single PDF (streamed to disk) ──
+    if not name_lower.endswith(".pdf"):
+        return "Please upload a valid PDF or ZIP file.", 400
 
     file_id = uuid.uuid4().hex[:12]
     safe_name = secure_filename(f.filename)
     save_path = os.path.join(app.config["UPLOAD_FOLDER"], f"{file_id}.pdf")
     f.save(save_path)
 
-    FILE_REGISTRY[file_id] = {"filename": safe_name, "path": save_path}
+    FILE_REGISTRY[file_id] = {
+        "filename": safe_name,
+        "path": save_path,
+        "redacted": False,
+        "hash": _hash_file(save_path),
+    }
     _save_registry()
     return redirect(url_for("editor", file_id=file_id))
 
@@ -579,7 +709,93 @@ def editor(file_id):
     info = FILE_REGISTRY.get(file_id)
     if not info:
         return "File not found.", 404
-    return render_template("editor.html", file_id=file_id, filename=info["filename"])
+    return render_template(
+        "editor.html",
+        file_id=file_id,
+        filename=info["filename"],
+        batch_id=info.get("batch_id", ""),
+    )
+
+
+def _batch_file_list(batch):
+    """Build the per-file status list for a batch."""
+    files = []
+    for fid in batch["file_ids"]:
+        info = FILE_REGISTRY.get(fid, {})
+        files.append({
+            "file_id": fid,
+            "filename": info.get("filename", fid),
+            "redacted": bool(info.get("redacted")),
+            "drawing_id": info.get("drawing_id", ""),
+        })
+    return files
+
+
+@app.route("/batch/<batch_id>")
+def batch_view(batch_id):
+    batch = BATCH_REGISTRY.get(batch_id)
+    if not batch:
+        return "Batch not found.", 404
+    files = _batch_file_list(batch)
+    return render_template(
+        "batch.html",
+        batch_id=batch_id,
+        batch_name=batch.get("name", "Batch"),
+        files=files,
+        total=len(files),
+        redacted_count=sum(1 for f in files if f["redacted"]),
+    )
+
+
+@app.route("/api/batch/<batch_id>/status")
+def batch_status(batch_id):
+    batch = BATCH_REGISTRY.get(batch_id)
+    if not batch:
+        return jsonify({"error": "not found"}), 404
+    files = _batch_file_list(batch)
+    return jsonify({
+        "files": files,
+        "total": len(files),
+        "redacted_count": sum(1 for f in files if f["redacted"]),
+    })
+
+
+@app.route("/download-all/<batch_id>")
+def download_all(batch_id):
+    batch = BATCH_REGISTRY.get(batch_id)
+    if not batch:
+        return "not found", 404
+
+    mem = io.BytesIO()
+    used = set()
+    count = 0
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fid in batch["file_ids"]:
+            info = FILE_REGISTRY.get(fid)
+            if not info or not info.get("redacted"):
+                continue
+            out_path = os.path.join(
+                app.config["OUTPUT_FOLDER"], f"{fid}_redacted.pdf"
+            )
+            if not os.path.exists(out_path):
+                continue
+            drawing_id = info.get("drawing_id", "")
+            arcname = f"{drawing_id}.pdf" if drawing_id else f"REDACTED_{info.get('filename', 'file.pdf')}"
+            if arcname in used:
+                arcname = f"{fid}_{arcname}"
+            used.add(arcname)
+            zf.write(out_path, arcname)
+            count += 1
+
+    if count == 0:
+        return "No redacted files yet.", 404
+
+    mem.seek(0)
+    zip_name = (batch.get("name") or "batch").rsplit(".", 1)[0] + "_redacted.zip"
+    return send_file(
+        mem, as_attachment=True, download_name=zip_name,
+        mimetype="application/zip",
+    )
 
 
 # ──────────────────────────── API ──────────────────────────────
@@ -593,6 +809,10 @@ def scan(file_id):
     total_pages, page_dims, blocks = _extract_blocks(info["path"])
     SCAN_CACHE[file_id] = blocks
 
+    # Prior work for this exact drawing (by content hash), if any.
+    h = info.get("hash")
+    saved = DRAWING_STORE.get(h) if h else None
+
     return jsonify({
         "file_id": file_id,
         "filename": info["filename"],
@@ -600,6 +820,7 @@ def scan(file_id):
         "page_dimensions": page_dims,
         "render_dpi": RENDER_DPI,
         "blocks": blocks,
+        "saved": saved,
     })
 
 
@@ -676,21 +897,27 @@ def extract_metadata(file_id):
 
     # Extract metadata via Gemini
     meta_error = None
+    empty_meta = {
+        "client_name": "",
+        "original_part_id": "",
+        "part_name": "",
+        "quantity": "1",
+        "material": "",
+    }
     _log(f"[META] file_id={file_id}, removed_blocks={len(removed_blocks)}")
-    _log(f"[META] removed texts: {[b['text'][:60] for b in removed_blocks[:10]]}")
-    try:
-        metadata = _extract_metadata_gemini(removed_blocks)
-        _log(f"[META] extracted: {metadata}")
-    except Exception as e:
-        meta_error = str(e)[:200]
-        _log(f"[META] ERROR: {meta_error}")
-        metadata = {
-            "client_name": "",
-            "original_part_id": "",
-            "part_name": "",
-            "quantity": "1",
-            "material": "",
-        }
+    if not removed_blocks:
+        # No text blocks selected (e.g. manual white-box masking only).
+        # Skip the Gemini call but still generate a Drawing ID below.
+        metadata = dict(empty_meta)
+    else:
+        _log(f"[META] removed texts: {[b['text'][:60] for b in removed_blocks[:10]]}")
+        try:
+            metadata = _extract_metadata_gemini(removed_blocks)
+            _log(f"[META] extracted: {metadata}")
+        except Exception as e:
+            meta_error = str(e)[:200]
+            _log(f"[META] ERROR: {meta_error}")
+            metadata = dict(empty_meta)
 
     # Material is usually KEPT (not removed), so scan ALL blocks for it
     if not metadata.get("material"):
@@ -716,14 +943,21 @@ def extract_metadata(file_id):
             if metadata.get("material"):
                 break
 
-    # Generate the next Drawing ID from the spreadsheet
+    # Drawing ID: reuse the one already assigned to this drawing (by content
+    # hash) so reopening never mints a new ID; otherwise generate the next one.
     drawing_id_error = None
-    try:
-        drawing_id = generate_drawing_id()
-    except Exception as e:
-        drawing_id = "DI_ERROR"
-        drawing_id_error = f"{type(e).__name__}: {e}"
-        _log(f"[DRAWING_ID] ERROR: {drawing_id_error}")
+    h = info.get("hash")
+    stored = DRAWING_STORE.get(h) if h else None
+    if stored and stored.get("drawing_id") and stored["drawing_id"] != "DI_ERROR":
+        drawing_id = stored["drawing_id"]
+        _log(f"[DRAWING_ID] reused {drawing_id} for hash {h[:12]}")
+    else:
+        try:
+            drawing_id = generate_drawing_id()
+        except Exception as e:
+            drawing_id = "DI_ERROR"
+            drawing_id_error = f"{type(e).__name__}: {e}"
+            _log(f"[DRAWING_ID] ERROR: {drawing_id_error}")
 
     return jsonify({
         "drawing_id": drawing_id,
@@ -741,15 +975,16 @@ def redact(file_id):
 
     data = request.get_json()
     redact_blocks = data.get("blocks", [])
+    manual_boxes = data.get("manual_boxes", [])
     drawing_id = data.get("drawing_id", "")
     metadata = data.get("metadata", {})
 
     # Debug: log what metadata we received
     _log(f"[REDACT] file_id={file_id}, drawing_id={drawing_id}")
     _log(f"[REDACT] metadata={metadata}")
-    _log(f"[REDACT] blocks_to_redact={len(redact_blocks)}")
+    _log(f"[REDACT] blocks_to_redact={len(redact_blocks)}, manual_boxes={len(manual_boxes)}")
 
-    if not redact_blocks:
+    if not redact_blocks and not manual_boxes:
         return jsonify({"error": "no blocks to redact"}), 400
 
     output_path = os.path.join(
@@ -758,28 +993,35 @@ def redact(file_id):
 
     doc = fitz.open(info["path"])
 
-    # Step 1: Apply redactions (existing logic)
+    # Step 1: Apply redactions.
+    # Detected text/image blocks get a small pad to catch edge glyphs;
+    # user-drawn manual masks are applied exactly as drawn (pad=0).
+    REDACT_PAD = 3  # pt
     pages_map = {}
     for bl in redact_blocks:
-        pg = bl["page"]
-        pages_map.setdefault(pg, []).append(bl["bbox_pt"])
+        pages_map.setdefault(bl["page"], []).append((bl["bbox_pt"], REDACT_PAD))
+    for mb in manual_boxes:
+        try:
+            pages_map.setdefault(int(mb["page"]), []).append((mb["bbox_pt"], 0))
+        except (KeyError, TypeError, ValueError):
+            continue
 
-    REDACT_PAD = 3  # pt padding to catch edge characters
-
-    for page_num, bboxes in pages_map.items():
+    for page_num, entries in pages_map.items():
         page = doc[page_num]
         page_rect = page.rect
-        for bbox in bboxes:
+        for bbox, pad in entries:
             rect = fitz.Rect(bbox)
-            rect.x0 = max(rect.x0 - REDACT_PAD, page_rect.x0)
-            rect.y0 = max(rect.y0 - REDACT_PAD, page_rect.y0)
-            rect.x1 = min(rect.x1 + REDACT_PAD, page_rect.x1)
-            rect.y1 = min(rect.y1 + REDACT_PAD, page_rect.y1)
+            rect.x0 = max(rect.x0 - pad, page_rect.x0)
+            rect.y0 = max(rect.y0 - pad, page_rect.y0)
+            rect.x1 = min(rect.x1 + pad, page_rect.x1)
+            rect.y1 = min(rect.y1 + pad, page_rect.y1)
             page.add_redact_annot(rect, fill=(1, 1, 1))  # white fill
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
 
-    # Step 2: Overlay "Mechximize" + Drawing ID on the title block
-    if drawing_id and drawing_id != "DI_ERROR":
+    # Step 2: Overlay "Mechximize" + Drawing ID on the title block.
+    # Requires detected title-block text blocks to anchor to — skipped when
+    # only manual masks were applied.
+    if drawing_id and drawing_id != "DI_ERROR" and redact_blocks:
         scan_blocks = SCAN_CACHE.get(file_id)
         if not scan_blocks:
             _, _, scan_blocks = _extract_blocks(info["path"])
@@ -790,11 +1032,12 @@ def redact(file_id):
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
 
-    # Step 3: Write row to Google Sheets
+    # Step 3: Write to Google Sheets (idempotent — updates the existing row for
+    # this Drawing ID on reprocess instead of duplicating it).
     sheets_error = None
     if drawing_id and drawing_id != "DI_ERROR":
         try:
-            append_drawing_row(
+            append_or_update_drawing_row(
                 drawing_id=drawing_id,
                 company_name=metadata.get("client_name", ""),
                 original_part_id=metadata.get("original_part_id", ""),
@@ -805,10 +1048,25 @@ def redact(file_id):
         except Exception as e:
             sheets_error = str(e)[:100]
 
-    # Store drawing_id for download filename
+    # Mark redacted (for batch status / Download All) and store the drawing_id
+    # for the download filename.
+    FILE_REGISTRY[file_id]["redacted"] = True
     if drawing_id and drawing_id != "DI_ERROR":
         FILE_REGISTRY[file_id]["drawing_id"] = drawing_id
-        _save_registry()
+    _save_registry()
+
+    # Step 4: Persist editing state keyed by content hash, so reopening this
+    # exact drawing later restores its Drawing ID + prior selections.
+    h = info.get("hash")
+    if h and drawing_id and drawing_id != "DI_ERROR":
+        DRAWING_STORE[h] = {
+            "drawing_id": drawing_id,
+            "metadata": metadata,
+            "redact_block_ids": [bl.get("id") for bl in redact_blocks if bl.get("id")],
+            "manual_boxes": manual_boxes,
+            "filename": info.get("filename", ""),
+        }
+        _save_drawing_store()
 
     return jsonify({
         "status": "ok",

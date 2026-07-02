@@ -6,6 +6,7 @@
     window.APP_STATE = {
         fileId: window.FILE_ID,
         filename: window.FILE_NAME,
+        batchId: window.BATCH_ID || '',
         totalPages: 0,
         currentPage: 0,
         blocks: [],
@@ -13,10 +14,15 @@
         manualRedactSet: new Set(),
         autoFlaggedSet: new Set(),
         aiFlaggedSet: new Set(),
+        manualBoxes: [],          // user-drawn white masks: {id, page, bbox_pt}
+        renderScale: 150 / 72,    // px-per-point; refined from scan response
+        drawMode: false,
         autoDetectOn: false,
-        aiDecisions: null,  // blockId -> {action, reason}
+        aiDecisions: null,        // blockId -> {action, reason}
         drawingId: null,
         metadata: null,
+        metadataExtracted: false,
+        metadataExtracting: false,
     };
 
     const state = window.APP_STATE;
@@ -26,6 +32,7 @@
     const nextBtn = document.getElementById('nextPage');
     const pageInfo = document.getElementById('pageInfo');
     const autoBtn = document.getElementById('autoDetect');
+    const maskBtn = document.getElementById('maskBox');
     const aiBtn = document.getElementById('aiAnalyze');
     const confirmAIBtn = document.getElementById('confirmAI');
     const aiStatus = document.getElementById('ai-status');
@@ -46,6 +53,11 @@
             state.totalPages = data.total_pages;
             state.blocks = data.blocks;
             state.currentPage = 0;
+            if (data.render_dpi) state.renderScale = data.render_dpi / 72;
+
+            // If this exact drawing was processed before, restore its Drawing ID
+            // and prior redactions so the user builds on it instead of restarting.
+            if (data.saved) restoreSavedState(data.saved);
 
             updatePageNav();
 
@@ -54,9 +66,51 @@
 
             // Sidebar shows ALL blocks across all pages
             window.sidebar.renderList(state.blocks);
+
+            // Reflect any restored selections in the counter / Process button.
+            window.sync.updateRedactCount();
         } catch (err) {
             console.error('Init error:', err);
             alert('Failed to scan PDF. Please try again.');
+        }
+    }
+
+    // ── Restore prior work for a reopened drawing ──
+    function restoreSavedState(sv) {
+        var restored = 0;
+        (sv.redact_block_ids || []).forEach(function (id) {
+            if (state.blocks.some(function (b) { return b.id === id; })) {
+                state.redactSet.add(id);
+                state.manualRedactSet.add(id);
+                restored++;
+            }
+        });
+        (sv.manual_boxes || []).forEach(function (mb, i) {
+            state.manualBoxes.push({ id: 'mb_saved_' + i, page: mb.page, bbox_pt: mb.bbox_pt });
+        });
+
+        if (sv.drawing_id) {
+            state.drawingId = sv.drawing_id;
+            state.metadata = sv.metadata || null;
+            state.metadataExtracted = true;   // reuse the existing ID; never regenerate
+
+            var m = sv.metadata || {};
+            var set = function (id, v) { var el = document.getElementById(id); if (el) el.value = v || ''; };
+            set('meta-client', m.client_name);
+            set('meta-part-id', m.original_part_id);
+            set('meta-part-name', m.part_name);
+            set('meta-quantity', m.quantity || '1');
+            set('meta-material', m.material);
+
+            var badge = document.getElementById('drawing-id-badge');
+            if (badge) badge.textContent = sv.drawing_id;
+            var panel = document.getElementById('drawing-info-panel');
+            if (panel) panel.classList.remove('hidden');
+            var footer = document.querySelector('.drawing-info-footer');
+            if (footer) {
+                footer.innerHTML = '<span style="color:#3fb950;">↺ Reopened — Drawing ID ' +
+                    sv.drawing_id + ' and ' + restored + ' prior selection(s) restored.</span>';
+            }
         }
     }
 
@@ -116,6 +170,27 @@
         }
     });
 
+    // ── Mask Box (draw white boxes over undetected content) ──
+    maskBtn.addEventListener('click', function () {
+        state.drawMode = !state.drawMode;
+        maskBtn.classList.toggle('active', state.drawMode);
+        window.viewer.setDrawMode(state.drawMode);
+    });
+
+    // ── Auto-generate Drawing ID for ANY redaction method ──
+    // Fires (debounced) whenever the redaction selection changes, so manually
+    // redacting no longer requires running AI to get a pseudonymized ID.
+    var _metaTimer = null;
+    document.addEventListener('redactchange', function () {
+        clearTimeout(_metaTimer);
+        _metaTimer = setTimeout(function () {
+            if (state.metadataExtracted || state.metadataExtracting) return;
+            if (state.redactSet.size > 0 || state.manualBoxes.length > 0) {
+                extractMetadata(false);
+            }
+        }, 700);
+    });
+
     // ── AI Analyze ──
     aiBtn.addEventListener('click', async function () {
         aiBtn.disabled = true;
@@ -173,15 +248,29 @@
     confirmAIBtn.addEventListener('click', function () {
         window.sync.applyAISuggestions();
         confirmAIBtn.classList.add('hidden');
-        // Automatically extract metadata after confirming AI suggestions
-        extractMetadata();
+        // Re-extract metadata using the (now larger) AI selection.
+        extractMetadata(true);
     });
 
-    // ── Extract Metadata ──
-    async function extractMetadata() {
-        var blockIds = Array.from(state.redactSet);
-        if (blockIds.length === 0) return;
+    // ── Extract Metadata + generate Drawing ID ──
+    // force=false: run once (auto-trigger); force=true: re-run (AI confirm /
+    // Process safety-net). Works for manual, PII-auto, or AI selections — and
+    // still generates a Drawing ID when only manual masks are drawn.
+    function extractMetadata(force) {
+        // Concurrent callers (auto-trigger + Process safety-net) share the
+        // same in-flight promise so Process can await an ID already generating.
+        if (state.metadataExtracting && state._metaPromise) return state._metaPromise;
+        if (state.metadataExtracted && !force) return Promise.resolve();
 
+        var blockIds = Array.from(state.redactSet);
+        if (blockIds.length === 0 && state.manualBoxes.length === 0) return Promise.resolve();
+
+        state.metadataExtracting = true;
+        state._metaPromise = _doExtractMetadata(blockIds);
+        return state._metaPromise;
+    }
+
+    async function _doExtractMetadata(blockIds) {
         var panel = document.getElementById('drawing-info-panel');
         var badge = document.getElementById('drawing-id-badge');
         badge.textContent = 'Generating...';
@@ -198,6 +287,7 @@
 
             state.drawingId = data.drawing_id;
             state.metadata = data.metadata;
+            state.metadataExtracted = true;
 
             badge.textContent = data.drawing_id;
             document.getElementById('meta-client').value = data.metadata.client_name || '';
@@ -207,30 +297,39 @@
             document.getElementById('meta-material').value = data.metadata.material || '';
 
             // Warn if metadata extraction had errors or returned empty
+            var footer = document.querySelector('.drawing-info-footer');
             if (data.meta_error) {
                 console.warn('Metadata extraction error:', data.meta_error);
-                var footer = document.querySelector('.drawing-info-footer');
                 if (footer) {
                     footer.innerHTML = '<span style="color:#f85149;">⚠ Metadata extraction failed — please fill fields manually</span>';
                 }
             } else if (!data.metadata.client_name && !data.metadata.original_part_id) {
-                var footer = document.querySelector('.drawing-info-footer');
                 if (footer) {
-                    footer.innerHTML = '<span style="color:#f0883e;">⚠ Could not auto-detect details — please verify fields</span>';
+                    footer.innerHTML = '<span style="color:#f0883e;">⚠ Verify fields — auto-detect found little. Drawing ID still assigned.</span>';
                 }
             }
         } catch (err) {
             console.error('Metadata extraction error:', err);
             badge.textContent = 'Error';
+        } finally {
+            state.metadataExtracting = false;
         }
     }
 
     // ── Process redaction ──
     processBtn.addEventListener('click', async function () {
-        if (state.redactSet.size === 0) return;
+        if (state.redactSet.size === 0 && state.manualBoxes.length === 0) return;
 
         processBtn.disabled = true;
         processBtn.textContent = 'Processing...';
+
+        // Safety net: guarantee a Drawing ID exists regardless of how blocks
+        // were selected (manual, PII-auto, AI, or manual masks only).
+        if (!state.drawingId) {
+            processBtn.textContent = 'Generating ID...';
+            await extractMetadata(true);
+            processBtn.textContent = 'Processing...';
+        }
 
         // Build the redaction payload
         const blocksToRedact = [];
@@ -245,6 +344,11 @@
             }
         });
 
+        // Manual white masks (user-drawn over undetected content)
+        var manualBoxes = state.manualBoxes.map(function (b) {
+            return { page: b.page, bbox_pt: b.bbox_pt };
+        });
+
         // Read metadata from UI fields (user may have edited them)
         var metadata = {
             client_name: document.getElementById('meta-client').value,
@@ -256,6 +360,7 @@
 
         var payload = {
             blocks: blocksToRedact,
+            manual_boxes: manualBoxes,
             drawing_id: state.drawingId || '',
             metadata: metadata,
         };
@@ -271,7 +376,8 @@
             const data = await res.json();
 
             // Show download modal with Drawing ID
-            var msg = blocksToRedact.length + ' block(s) redacted successfully.';
+            var totalMasks = blocksToRedact.length + manualBoxes.length;
+            var msg = totalMasks + ' region(s) redacted successfully.';
             if (data.drawing_id) {
                 msg += ' Drawing ID: ' + data.drawing_id;
             }
@@ -282,6 +388,14 @@
             downloadLink.href = data.download_url;
             var dlName = data.drawing_id ? data.drawing_id + '.pdf' : 'REDACTED_' + state.filename;
             downloadLink.textContent = 'Download ' + dlName;
+
+            // Batch context: offer a way back to the batch list
+            var batchLink = document.getElementById('batch-link');
+            if (state.batchId && batchLink) {
+                batchLink.href = '/batch/' + state.batchId;
+                batchLink.classList.remove('hidden');
+            }
+
             modal.classList.remove('hidden');
         } catch (err) {
             console.error('Redaction error:', err);
@@ -308,6 +422,19 @@
             inp.setAttribute('readonly', '');
         });
     });
+
+    // The on-screen (touch) keyboard can leave the page scrolled or the layout
+    // offset after it closes, which was making the sidebar unreachable. Snap the
+    // root viewport back to origin whenever focus leaves a field or the visual
+    // viewport resizes (keyboard open/close).
+    function _restoreViewport() {
+        window.scrollTo(0, 0);
+        if (document.scrollingElement) document.scrollingElement.scrollTop = 0;
+    }
+    document.addEventListener('focusout', _restoreViewport);
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener('resize', _restoreViewport);
+    }
 
     // Kick off
     init();

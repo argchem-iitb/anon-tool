@@ -10,7 +10,7 @@
     <!-- Header -->
     <header id="header">
         <div class="header-left">
-            <a href="/" class="back-link">&larr; Back</a>
+            <a href="{{ '/batch/' + batch_id if batch_id else '/' }}" class="back-link">&larr; {{ 'Batch' if batch_id else 'Back' }}</a>
             <span class="file-label" title="{{ filename }}">{{ filename }}</span>
         </div>
         <div class="header-center">
@@ -20,6 +20,7 @@
         </div>
         <div class="header-right">
             <button id="autoDetect" class="hdr-btn toggle-btn">Auto-Detect PII</button>
+            <button id="maskBox" class="hdr-btn toggle-btn" title="Draw white boxes over anything the detector missed">Mask Box</button>
             <button id="aiAnalyze" class="hdr-btn ai-btn">AI Analyze</button>
             <span id="redactCount" class="badge-count">0 selected</span>
             <button id="confirmAI" class="hdr-btn confirm-ai-btn hidden">Confirm AI Suggestions</button>
@@ -97,6 +98,7 @@
             <h3>Redaction Complete</h3>
             <p id="modal-msg"></p>
             <a id="download-link" class="hdr-btn process-btn" download>Download Redacted PDF</a>
+            <a id="batch-link" class="hdr-btn hidden" href="#">Back to Batch</a>
             <button id="modal-close" class="hdr-btn">Close</button>
         </div>
     </div>
@@ -105,6 +107,7 @@
         // Inject backend data
         window.FILE_ID = "{{ file_id }}";
         window.FILE_NAME = "{{ filename }}";
+        window.BATCH_ID = "{{ batch_id }}";
     </script>
     <script src="/static/js/viewer.js"></script>
     <script src="/static/js/sidebar.js"></script>

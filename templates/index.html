@@ -90,14 +90,14 @@
 <body>
     <form class="upload-card" action="/upload" method="POST" enctype="multipart/form-data">
         <h1>PDF Redaction Tool</h1>
-        <p>Upload an engineering PDF to scan, review, and redact sensitive information.</p>
+        <p>Upload an engineering PDF &mdash; or a ZIP of PDFs for batch processing &mdash; to scan, review, and redact sensitive information.</p>
 
         <div class="drop-zone" id="dropZone">
             <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm4 18H6V4h7v5h5v11zM8 15h8v2H8v-2z"/></svg>
-            <div class="label">Drop a PDF here or click to browse</div>
+            <div class="label">Drop a PDF or ZIP here or click to browse</div>
             <div class="filename" id="fileName"></div>
         </div>
-        <input type="file" name="pdf" id="fileInput" accept=".pdf">
+        <input type="file" name="pdf" id="fileInput" accept=".pdf,.zip">
 
         <button type="submit" class="btn" id="submitBtn">Scan &amp; Redact</button>
     </form>

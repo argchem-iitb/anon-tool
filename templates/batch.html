@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Batch - {{ batch_name }}</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            min-height: 100vh;
+        }
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 0 20px;
+            height: 56px;
+            background: #161b22;
+            border-bottom: 1px solid #30363d;
+        }
+        .header-left { display: flex; align-items: center; gap: 14px; }
+        .back-link { color: #58a6ff; text-decoration: none; font-size: 14px; }
+        .batch-title { font-weight: 600; font-size: 15px; }
+        .batch-title .zip-name { color: #8b949e; font-weight: 400; }
+        .btn {
+            display: inline-block;
+            padding: 8px 16px;
+            background: #238636;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            text-decoration: none;
+            transition: background 0.2s, opacity 0.2s;
+        }
+        .btn:hover { background: #2ea043; }
+        .btn:disabled, .btn.disabled {
+            background: #21262d; color: #484f58; cursor: default;
+            pointer-events: none;
+        }
+        .wrap { max-width: 900px; margin: 0 auto; padding: 28px 20px; }
+        .progress-row {
+            display: flex; align-items: center; gap: 12px;
+            margin-bottom: 20px; font-size: 14px; color: #8b949e;
+        }
+        .progress-bar {
+            flex: 1; height: 8px; background: #21262d;
+            border-radius: 4px; overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%; background: #238636; width: 0%;
+            transition: width 0.3s;
+        }
+        table { width: 100%; border-collapse: collapse; }
+        th, td {
+            text-align: left; padding: 12px 14px;
+            border-bottom: 1px solid #21262d; font-size: 14px;
+        }
+        th { color: #8b949e; font-weight: 600; font-size: 12px; text-transform: uppercase; }
+        tr:hover td { background: #161b22; }
+        .fname { color: #e6edf3; word-break: break-all; }
+        .status {
+            display: inline-block; padding: 2px 10px; border-radius: 10px;
+            font-size: 12px; font-weight: 600;
+        }
+        .status.pending { background: #f0883e26; color: #f0883e; }
+        .status.done { background: #3fb95026; color: #3fb950; }
+        .drawing-id {
+            font-family: 'Consolas', monospace; font-size: 12px; color: #58a6ff;
+        }
+        .open-link {
+            color: #58a6ff; text-decoration: none; font-size: 13px;
+            border: 1px solid #30363d; border-radius: 6px; padding: 5px 12px;
+        }
+        .open-link:hover { border-color: #58a6ff; }
+        td.actions { text-align: right; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="header-left">
+            <a href="/" class="back-link">&larr; New upload</a>
+            <span class="batch-title">Batch <span class="zip-name">{{ batch_name }}</span></span>
+        </div>
+        <a href="/download-all/{{ batch_id }}" id="downloadAll" class="btn disabled">Download All (ZIP)</a>
+    </header>
+
+    <div class="wrap">
+        <div class="progress-row">
+            <span id="progress-label">{{ redacted_count }} / {{ total }} redacted</span>
+            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>File</th>
+                    <th>Status</th>
+                    <th>Drawing ID</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody id="file-rows">
+                {% for f in files %}
+                <tr data-file-id="{{ f.file_id }}">
+                    <td>{{ loop.index }}</td>
+                    <td class="fname">{{ f.filename }}</td>
+                    <td class="status-cell">
+                        {% if f.redacted %}
+                        <span class="status done">Redacted</span>
+                        {% else %}
+                        <span class="status pending">Pending</span>
+                        {% endif %}
+                    </td>
+                    <td class="drawing-id">{{ f.drawing_id }}</td>
+                    <td class="actions">
+                        <a class="open-link" href="/editor/{{ f.file_id }}">
+                            {% if f.redacted %}Re-open{% else %}Open{% endif %}
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        var BATCH_ID = "{{ batch_id }}";
+        var TOTAL = {{ total }};
+
+        function render(files, redactedCount) {
+            files.forEach(function (f) {
+                var row = document.querySelector('tr[data-file-id="' + f.file_id + '"]');
+                if (!row) return;
+                var statusCell = row.querySelector('.status-cell');
+                var idCell = row.querySelector('.drawing-id');
+                var openLink = row.querySelector('.open-link');
+                if (f.redacted) {
+                    statusCell.innerHTML = '<span class="status done">Redacted</span>';
+                    openLink.textContent = 'Re-open';
+                } else {
+                    statusCell.innerHTML = '<span class="status pending">Pending</span>';
+                    openLink.textContent = 'Open';
+                }
+                idCell.textContent = f.drawing_id || '';
+            });
+
+            var label = document.getElementById('progress-label');
+            var fill = document.getElementById('progress-fill');
+            var dlBtn = document.getElementById('downloadAll');
+            label.textContent = redactedCount + ' / ' + TOTAL + ' redacted';
+            fill.style.width = TOTAL ? (100 * redactedCount / TOTAL) + '%' : '0%';
+            if (redactedCount > 0) dlBtn.classList.remove('disabled');
+            else dlBtn.classList.add('disabled');
+        }
+
+        // Initial fill width
+        render([], {{ redacted_count }});
+
+        // Poll status so the list reflects redactions done in the editor.
+        async function poll() {
+            try {
+                var res = await fetch('/api/batch/' + BATCH_ID + '/status');
+                if (!res.ok) return;
+                var data = await res.json();
+                render(data.files, data.redacted_count);
+            } catch (e) { /* ignore */ }
+        }
+        setInterval(poll, 4000);
+        // Refresh when returning to this tab (e.g. after redacting in editor).
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) poll();
+        });
+    </script>
+</body>
+</html>

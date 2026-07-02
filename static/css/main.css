@@ -215,6 +215,51 @@ body {
     border-style: solid !important;
 }
 
+/* ── Manual white-box masking ── */
+.page-drawlayer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;   /* transparent to clicks unless draw mode is on */
+    z-index: 15;
+}
+body.draw-mode .page-drawlayer {
+    pointer-events: auto;
+    cursor: crosshair;
+}
+.draw-band {
+    position: absolute;
+    border: 1.5px dashed #f85149;
+    background: rgba(248, 81, 73, 0.12);
+    pointer-events: none;
+    z-index: 16;
+}
+.manual-box {
+    position: absolute;
+    background: rgba(255, 255, 255, 0.55);   /* preview of the white mask */
+    border: 1px dashed #f85149;
+    pointer-events: none;                    /* box itself ignores clicks */
+    z-index: 14;
+}
+.manual-box-del {
+    position: absolute;
+    top: -10px;
+    right: -10px;
+    width: 18px;
+    height: 18px;
+    line-height: 16px;
+    text-align: center;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: #f85149;
+    color: #fff;
+    font-size: 13px;
+    cursor: pointer;
+    pointer-events: auto;                    /* but its delete handle works */
+    z-index: 17;
+}
+.manual-box-del:hover { background: #ff6b64; }
+
 /* ── Loading overlay ── */
 .loading-overlay {
     position: absolute;
@@ -248,10 +293,13 @@ body {
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
+    overflow: hidden;   /* children (list / panel) do the scrolling */
+    min-height: 0;      /* allow flex children to shrink & scroll */
 }
 #sidebar-header {
     padding: 12px;
     border-bottom: 1px solid #30363d;
+    flex-shrink: 0;     /* keep filter/stats pinned at the top */
 }
 #filterInput {
     width: 100%;
@@ -274,7 +322,11 @@ body {
 #block-list {
     list-style: none;
     overflow-y: auto;
-    flex: 1;
+    flex: 1 1 auto;
+    min-height: 0;                  /* critical: scroll internally instead of
+                                       overflowing the sidebar off-screen */
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
 }
 .block-item {
     padding: 10px 12px;
@@ -426,6 +478,9 @@ body {
     padding: 12px;
     border-bottom: 1px solid #30363d;
     background: #1c2128;
+    flex-shrink: 0;        /* don't get squeezed by the list... */
+    max-height: 50%;       /* ...but never eat more than half the sidebar */
+    overflow-y: auto;      /* scroll within itself if cramped */
 }
 .drawing-info-header {
     display: flex;

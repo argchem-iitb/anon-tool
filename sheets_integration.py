@@ -118,3 +118,45 @@ def append_drawing_row(
     cell_range = f"A{next_row}:L{next_row}"
     sheet.update(cell_range, [row], value_input_option="USER_ENTERED")
     return row
+
+
+def append_or_update_drawing_row(
+    drawing_id,
+    company_name,
+    original_part_id,
+    part_name,
+    quantity,
+    material,
+    status="Under Process",
+):
+    """Idempotent write: if a row with this Drawing ID (column D) already exists,
+    update only the tool-owned columns; otherwise append a new row.
+
+    Reprocessing a reopened drawing must NOT create a duplicate row, and must NOT
+    wipe columns a human manages on the sheet — Order No (A), Quotation (C),
+    Vendor (K), Comments (L), and Status (J) are left untouched on update.
+    """
+    sheet = _get_sheet()
+
+    row_idx = None
+    for i, val in enumerate(sheet.col_values(4), start=1):  # column D
+        if str(val).strip() == str(drawing_id).strip():
+            row_idx = i
+            break
+
+    if row_idx is None:
+        return append_drawing_row(
+            drawing_id, company_name, original_part_id,
+            part_name, quantity, material, status,
+        )
+
+    # Update only B (company) and E:H (qty, part id, part name, material).
+    sheet.batch_update(
+        [
+            {"range": f"B{row_idx}", "values": [[company_name]]},
+            {"range": f"E{row_idx}:H{row_idx}",
+             "values": [[str(quantity), original_part_id, part_name, material]]},
+        ],
+        value_input_option="USER_ENTERED",
+    )
+    return {"updated_row": row_idx}

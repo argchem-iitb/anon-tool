@@ -102,10 +102,16 @@ window.sync = (function () {
     }
 
     function updateRedactCount() {
-        const count = window.APP_STATE.redactSet.size;
+        const state = window.APP_STATE;
+        const manual = state.manualBoxes ? state.manualBoxes.length : 0;
+        const count = state.redactSet.size + manual;
         const el = document.getElementById('redactCount');
-        el.textContent = count + ' selected';
-        document.getElementById('processBtn').disabled = count === 0;
+        if (el) el.textContent = count + ' selected';
+        const pb = document.getElementById('processBtn');
+        if (pb) pb.disabled = count === 0;
+        // Notify app.js so it can auto-generate a Drawing ID for ANY redaction
+        // method (manual, PII auto-detect, or AI) — not just AI confirm.
+        document.dispatchEvent(new CustomEvent('redactchange'));
     }
 
     return {

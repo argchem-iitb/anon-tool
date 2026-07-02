@@ -12,6 +12,96 @@ window.viewer = (function () {
     function showLoading() { loading.classList.remove('hidden'); }
     function hideLoading() { loading.classList.add('hidden'); }
 
+    // ── Manual white-box masking ──
+    let _drawMode = false;
+    let _mbCounter = 0;
+
+    function setDrawMode(on) {
+        _drawMode = !!on;
+        document.body.classList.toggle('draw-mode', _drawMode);
+    }
+
+    function addManualBox(pageNum, bbox_pt) {
+        const state = window.APP_STATE;
+        if (!state.manualBoxes) state.manualBoxes = [];
+        const id = 'mb_' + pageNum + '_' + (_mbCounter++);
+        state.manualBoxes.push({ id: id, page: pageNum, bbox_pt: bbox_pt });
+        const pe = pageEls[pageNum];
+        if (pe) buildPageOverlay(pageNum, parseFloat(pe.wrapper.dataset.zoom) || 1);
+        if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
+    }
+
+    function removeManualBox(id) {
+        const state = window.APP_STATE;
+        if (!state.manualBoxes) return;
+        const idx = state.manualBoxes.findIndex(function (b) { return b.id === id; });
+        if (idx < 0) return;
+        const pageNum = state.manualBoxes[idx].page;
+        state.manualBoxes.splice(idx, 1);
+        const pe = pageEls[pageNum];
+        if (pe) buildPageOverlay(pageNum, parseFloat(pe.wrapper.dataset.zoom) || 1);
+        if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
+    }
+
+    /**
+     * Attach drag-to-draw handlers to a page's draw layer. Active only in
+     * draw mode; converts the drawn rectangle to PDF points and stores it.
+     */
+    function attachDrawHandlers(pageNum, layer) {
+        let startX = 0, startY = 0, band = null, drawing = false;
+
+        function localXY(e) {
+            const rect = layer.getBoundingClientRect();
+            return [e.clientX - rect.left, e.clientY - rect.top];
+        }
+
+        layer.addEventListener('mousedown', function (e) {
+            if (!_drawMode || e.button !== 0) return;
+            e.preventDefault();
+            const xy = localXY(e);
+            startX = xy[0]; startY = xy[1];
+            drawing = true;
+            band = document.createElement('div');
+            band.className = 'draw-band';
+            band.style.left = startX + 'px';
+            band.style.top = startY + 'px';
+            layer.appendChild(band);
+        });
+
+        layer.addEventListener('mousemove', function (e) {
+            if (!drawing || !band) return;
+            const xy = localXY(e);
+            const x = Math.min(startX, xy[0]), y = Math.min(startY, xy[1]);
+            const w = Math.abs(xy[0] - startX), h = Math.abs(xy[1] - startY);
+            band.style.left = x + 'px';
+            band.style.top = y + 'px';
+            band.style.width = w + 'px';
+            band.style.height = h + 'px';
+        });
+
+        function finish(e) {
+            if (!drawing) return;
+            drawing = false;
+            const xy = localXY(e);
+            const x = Math.min(startX, xy[0]), y = Math.min(startY, xy[1]);
+            const w = Math.abs(xy[0] - startX), h = Math.abs(xy[1] - startY);
+            if (band && band.parentNode) band.parentNode.removeChild(band);
+            band = null;
+            if (w < 5 || h < 5) return;  // ignore accidental clicks
+
+            const state = window.APP_STATE;
+            const pe = pageEls[pageNum];
+            const zoom = parseFloat(pe.wrapper.dataset.zoom) || 1;
+            const scale = state.renderScale || (150 / 72);
+            const f = 1 / (scale * zoom);  // displayed px -> PDF points
+            const bbox_pt = [x * f, y * f, (x + w) * f, (y + h) * f];
+            addManualBox(pageNum, bbox_pt);
+        }
+
+        layer.addEventListener('mouseup', finish);
+        layer.addEventListener('mouseleave', function (e) { if (drawing) finish(e); });
+    }
+
     /**
      * Render ALL pages stacked vertically with fit-to-width scaling.
      */
@@ -50,12 +140,20 @@ window.viewer = (function () {
                 const overlay = document.createElement('div');
                 overlay.className = 'page-overlay';
 
-                pageEls[pn] = { wrapper: wrapper, img: img, overlay: overlay, bboxEls: {} };
+                // Draw layer (captures drag-to-mask only when draw mode is on)
+                const drawlayer = document.createElement('div');
+                drawlayer.className = 'page-drawlayer';
+                attachDrawHandlers(pn, drawlayer);
+
+                pageEls[pn] = {
+                    wrapper: wrapper, img: img, overlay: overlay,
+                    drawlayer: drawlayer, bboxEls: {},
+                };
 
                 img.onload = function () {
                     // Fit to available width
                     var availWidth = scrollEl.clientWidth - 60;
-                    var zoom = Math.min(1, availWidth / img.naturalWidth);
+                    var zoom = Math.max(0.05, Math.min(1, availWidth / img.naturalWidth));
                     wrapper.dataset.zoom = zoom;
                     img.style.width = (img.naturalWidth * zoom) + 'px';
                     img.style.height = (img.naturalHeight * zoom) + 'px';
@@ -76,6 +174,7 @@ window.viewer = (function () {
 
                 inner.appendChild(img);
                 inner.appendChild(overlay);
+                inner.appendChild(drawlayer);
                 wrapper.appendChild(label);
                 wrapper.appendChild(inner);
                 container.appendChild(wrapper);
@@ -145,6 +244,33 @@ window.viewer = (function () {
             pe.overlay.appendChild(div);
             pe.bboxEls[block.id] = div;
         });
+
+        // Manual white-mask boxes (user-drawn, borderless white in output)
+        var scale = state.renderScale || (150 / 72);
+        var mboxes = (state.manualBoxes || []).filter(function (b) { return b.page === pageNum; });
+        mboxes.forEach(function (mb) {
+            var mdiv = document.createElement('div');
+            mdiv.className = 'manual-box';
+
+            var mx0 = mb.bbox_pt[0] * scale, my0 = mb.bbox_pt[1] * scale;
+            var mx1 = mb.bbox_pt[2] * scale, my1 = mb.bbox_pt[3] * scale;
+            mdiv.style.left   = (mx0 * zoom) + 'px';
+            mdiv.style.top    = (my0 * zoom) + 'px';
+            mdiv.style.width  = ((mx1 - mx0) * zoom) + 'px';
+            mdiv.style.height = ((my1 - my0) * zoom) + 'px';
+
+            var del = document.createElement('button');
+            del.className = 'manual-box-del';
+            del.textContent = '×';
+            del.title = 'Remove mask';
+            del.addEventListener('click', function (e) {
+                e.stopPropagation();
+                removeManualBox(mb.id);
+            });
+            mdiv.appendChild(del);
+
+            pe.overlay.appendChild(mdiv);
+        });
     }
 
     /**
@@ -205,7 +331,7 @@ window.viewer = (function () {
             var pe = pageEls[pn];
             var img = pe.img;
             if (!img.naturalWidth) return;
-            var zoom = Math.min(1, availWidth / img.naturalWidth);
+            var zoom = Math.max(0.05, Math.min(1, availWidth / img.naturalWidth));
             pe.wrapper.dataset.zoom = zoom;
             img.style.width = (img.naturalWidth * zoom) + 'px';
             img.style.height = (img.naturalHeight * zoom) + 'px';
@@ -249,5 +375,8 @@ window.viewer = (function () {
         clearSelection: clearSelection,
         scrollToPage: scrollToPage,
         refitAllPages: refitAllPages,
+        setDrawMode: setDrawMode,
+        addManualBox: addManualBox,
+        removeManualBox: removeManualBox,
     };
 })();
