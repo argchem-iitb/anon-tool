@@ -1016,7 +1016,16 @@ def redact(file_id):
             rect.x1 = min(rect.x1 + pad, page_rect.x1)
             rect.y1 = min(rect.y1 + pad, page_rect.y1)
             page.add_redact_annot(rect, fill=(1, 1, 1))  # white fill
-        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+        # IMAGE_PIXELS blanks only the pixels UNDER each box — critical for
+        # scanned/flattened drawings that are one full-page image (IMAGE_REMOVE
+        # would delete the whole image and blank the page). LINE_ART_REMOVE_IF_
+        # COVERED drops only vector art fully inside a box (e.g. a logo) while
+        # keeping border/geometry lines that merely cross it. The white fill
+        # still visually covers each redacted region.
+        page.apply_redactions(
+            images=fitz.PDF_REDACT_IMAGE_PIXELS,
+            graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+        )
 
     # Step 2: Overlay "Mechximize" + Drawing ID on the title block.
     # Requires detected title-block text blocks to anchor to — skipped when
