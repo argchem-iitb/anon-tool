@@ -12,13 +12,20 @@ window.viewer = (function () {
     function showLoading() { loading.classList.remove('hidden'); }
     function hideLoading() { loading.classList.add('hidden'); }
 
-    // ── Manual white-box masking ──
-    let _drawMode = false;
+    // ── Placement modes: 'mask' (draw white boxes) or 'text' (add text) ──
+    let _activeMode = null;   // null | 'mask' | 'text'
     let _mbCounter = 0;
+    let _tbCounter = 0;
 
-    function setDrawMode(on) {
-        _drawMode = !!on;
-        document.body.classList.toggle('draw-mode', _drawMode);
+    function setMode(mode) {
+        _activeMode = mode || null;
+        document.body.classList.toggle('mask-mode', _activeMode === 'mask');
+        document.body.classList.toggle('text-mode', _activeMode === 'text');
+    }
+
+    function rebuildPage(pageNum) {
+        var pe = pageEls[pageNum];
+        if (pe) buildPageOverlay(pageNum, parseFloat(pe.wrapper.dataset.zoom) || 1);
     }
 
     function addManualBox(pageNum, bbox_pt) {
@@ -43,6 +50,61 @@ window.viewer = (function () {
         if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
     }
 
+    // ── Custom text boxes (place text anywhere) ──
+    function addTextBox(pageNum, x_pt, y_pt) {
+        const state = window.APP_STATE;
+        if (!state.textBoxes) state.textBoxes = [];
+        const id = 'tb_' + pageNum + '_' + (_tbCounter++);
+        state.textBoxes.push({ id: id, page: pageNum, x_pt: x_pt, y_pt: y_pt, text: '', fontsize: 14 });
+        rebuildPage(pageNum);
+        if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
+        // Focus the fresh input so the user can type immediately.
+        const pe = pageEls[pageNum];
+        if (pe) {
+            const el = pe.overlay.querySelector('[data-tb-id="' + id + '"] .text-box-input');
+            if (el) el.focus();
+        }
+    }
+
+    function removeTextBox(id) {
+        const state = window.APP_STATE;
+        if (!state.textBoxes) return;
+        const idx = state.textBoxes.findIndex(function (t) { return t.id === id; });
+        if (idx < 0) return;
+        const pageNum = state.textBoxes[idx].page;
+        state.textBoxes.splice(idx, 1);
+        rebuildPage(pageNum);
+        if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
+    }
+
+    // Drag a text box by its grip handle (updates x_pt/y_pt in PDF points).
+    function attachTextDrag(handle, tb, pageNum) {
+        handle.addEventListener('mousedown', function (e) {
+            e.preventDefault(); e.stopPropagation();
+            const pe = pageEls[pageNum];
+            const zoom = parseFloat(pe.wrapper.dataset.zoom) || 1;
+            const scale = (window.APP_STATE.renderScale) || (150 / 72);
+            const f = 1 / (scale * zoom);
+            const startX = e.clientX, startY = e.clientY;
+            const origX = tb.x_pt, origY = tb.y_pt;
+            const tEl = pe.overlay.querySelector('[data-tb-id="' + tb.id + '"]');
+            function move(ev) {
+                tb.x_pt = Math.max(0, origX + (ev.clientX - startX) * f);
+                tb.y_pt = Math.max(0, origY + (ev.clientY - startY) * f);
+                if (tEl) {
+                    tEl.style.left = (tb.x_pt * scale * zoom) + 'px';
+                    tEl.style.top = (tb.y_pt * scale * zoom) + 'px';
+                }
+            }
+            function up() {
+                document.removeEventListener('mousemove', move);
+                document.removeEventListener('mouseup', up);
+            }
+            document.addEventListener('mousemove', move);
+            document.addEventListener('mouseup', up);
+        });
+    }
+
     /**
      * Attach drag-to-draw handlers to a page's draw layer. Active only in
      * draw mode; converts the drawn rectangle to PDF points and stores it.
@@ -56,7 +118,7 @@ window.viewer = (function () {
         }
 
         layer.addEventListener('mousedown', function (e) {
-            if (!_drawMode || e.button !== 0) return;
+            if (_activeMode !== 'mask' || e.button !== 0) return;
             e.preventDefault();
             const xy = localXY(e);
             startX = xy[0]; startY = xy[1];
@@ -100,6 +162,17 @@ window.viewer = (function () {
 
         layer.addEventListener('mouseup', finish);
         layer.addEventListener('mouseleave', function (e) { if (drawing) finish(e); });
+
+        // Text mode: a click on empty page area drops a new text box there.
+        layer.addEventListener('click', function (e) {
+            if (_activeMode !== 'text') return;
+            const xy = localXY(e);
+            const pe = pageEls[pageNum];
+            const zoom = parseFloat(pe.wrapper.dataset.zoom) || 1;
+            const scale = (window.APP_STATE.renderScale) || (150 / 72);
+            const f = 1 / (scale * zoom);
+            addTextBox(pageNum, xy[0] * f, xy[1] * f);
+        });
     }
 
     /**
@@ -271,6 +344,60 @@ window.viewer = (function () {
 
             pe.overlay.appendChild(mdiv);
         });
+
+        // Custom text boxes (black Helvetica text placed anywhere)
+        var tboxes = (state.textBoxes || []).filter(function (t) { return t.page === pageNum; });
+        tboxes.forEach(function (tb) {
+            var tEl = document.createElement('div');
+            tEl.className = 'text-box';
+            tEl.dataset.tbId = tb.id;
+            tEl.style.left = (tb.x_pt * scale * zoom) + 'px';
+            tEl.style.top  = (tb.y_pt * scale * zoom) + 'px';
+
+            var fontPx = Math.max(6, tb.fontsize * scale * zoom);
+
+            var input = document.createElement('input');
+            input.className = 'text-box-input';
+            input.value = tb.text || '';
+            input.placeholder = 'type text…';
+            input.style.fontSize = fontPx + 'px';
+            var sizeInput = function () {
+                var len = input.value.length || input.placeholder.length;
+                input.style.width = Math.max(40, (len + 1) * fontPx * 0.58) + 'px';
+            };
+            sizeInput();
+            input.addEventListener('input', function () {
+                tb.text = input.value;
+                sizeInput();
+                if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
+            });
+            input.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+            input.addEventListener('click', function (e) { e.stopPropagation(); });
+
+            // Floating toolbar (grip / font− font+ / delete), shown on hover/focus
+            var bar = document.createElement('div');
+            bar.className = 'text-box-bar';
+            var mkBtn = function (txt, title, fn) {
+                var b = document.createElement('button');
+                b.className = 'text-box-btn';
+                b.textContent = txt; b.title = title;
+                b.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+                b.addEventListener('click', function (e) { e.stopPropagation(); fn(); });
+                return b;
+            };
+            var grip = document.createElement('button');
+            grip.className = 'text-box-btn text-box-grip';
+            grip.textContent = '✥'; grip.title = 'Drag to move';
+            attachTextDrag(grip, tb, pageNum);
+            bar.appendChild(grip);
+            bar.appendChild(mkBtn('A−', 'Smaller', function () { tb.fontsize = Math.max(6, tb.fontsize - 2); rebuildPage(pageNum); }));
+            bar.appendChild(mkBtn('A+', 'Larger', function () { tb.fontsize = Math.min(96, tb.fontsize + 2); rebuildPage(pageNum); }));
+            bar.appendChild(mkBtn('×', 'Delete', function () { removeTextBox(tb.id); }));
+
+            tEl.appendChild(bar);
+            tEl.appendChild(input);
+            pe.overlay.appendChild(tEl);
+        });
     }
 
     /**
@@ -375,8 +502,10 @@ window.viewer = (function () {
         clearSelection: clearSelection,
         scrollToPage: scrollToPage,
         refitAllPages: refitAllPages,
-        setDrawMode: setDrawMode,
+        setMode: setMode,
         addManualBox: addManualBox,
         removeManualBox: removeManualBox,
+        addTextBox: addTextBox,
+        removeTextBox: removeTextBox,
     };
 })();

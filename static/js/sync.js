@@ -104,7 +104,10 @@ window.sync = (function () {
     function updateRedactCount() {
         const state = window.APP_STATE;
         const manual = state.manualBoxes ? state.manualBoxes.length : 0;
-        const count = state.redactSet.size + manual;
+        const texts = state.textBoxes
+            ? state.textBoxes.filter(function (t) { return (t.text || '').trim() !== ''; }).length
+            : 0;
+        const count = state.redactSet.size + manual + texts;
         const el = document.getElementById('redactCount');
         if (el) el.textContent = count + ' selected';
         const pb = document.getElementById('processBtn');

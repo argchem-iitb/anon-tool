@@ -976,16 +976,18 @@ def redact(file_id):
     data = request.get_json()
     redact_blocks = data.get("blocks", [])
     manual_boxes = data.get("manual_boxes", [])
+    text_boxes = data.get("text_boxes", [])
     drawing_id = data.get("drawing_id", "")
     metadata = data.get("metadata", {})
 
     # Debug: log what metadata we received
     _log(f"[REDACT] file_id={file_id}, drawing_id={drawing_id}")
     _log(f"[REDACT] metadata={metadata}")
-    _log(f"[REDACT] blocks_to_redact={len(redact_blocks)}, manual_boxes={len(manual_boxes)}")
+    _log(f"[REDACT] blocks={len(redact_blocks)}, manual_boxes={len(manual_boxes)}, text_boxes={len(text_boxes)}")
 
-    if not redact_blocks and not manual_boxes:
-        return jsonify({"error": "no blocks to redact"}), 400
+    has_text = any(str(t.get("text", "")).strip() for t in text_boxes)
+    if not redact_blocks and not manual_boxes and not has_text:
+        return jsonify({"error": "nothing to apply"}), 400
 
     output_path = os.path.join(
         app.config["OUTPUT_FOLDER"], f"{file_id}_redacted.pdf"
@@ -1038,6 +1040,27 @@ def redact(file_id):
         _overlay_new_labels(doc, redact_blocks, drawing_id,
                             scan_blocks=scan_blocks, metadata=metadata)
 
+    # Step 2.5: Place custom user text boxes (black Helvetica, on top of all).
+    for tb in text_boxes:
+        txt = str(tb.get("text", "")).strip()
+        if not txt:
+            continue
+        try:
+            pg = int(tb.get("page", 0))
+            if pg < 0 or pg >= len(doc):
+                continue
+            fs = float(tb.get("fontsize", 14)) or 14.0
+            x = float(tb.get("x_pt", 0))
+            y = float(tb.get("y_pt", 0))
+            # y is the text TOP (matching the editor preview); insert_text anchors
+            # at the baseline, so drop by ~cap height.
+            doc[pg].insert_text(
+                fitz.Point(x, y + fs * 0.85), txt,
+                fontsize=fs, fontname="helv", color=(0, 0, 0),
+            )
+        except Exception as e:
+            _log(f"[TEXTBOX] place failed: {e}")
+
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
 
@@ -1073,6 +1096,7 @@ def redact(file_id):
             "metadata": metadata,
             "redact_block_ids": [bl.get("id") for bl in redact_blocks if bl.get("id")],
             "manual_boxes": manual_boxes,
+            "text_boxes": text_boxes,
             "filename": info.get("filename", ""),
         }
         _save_drawing_store()

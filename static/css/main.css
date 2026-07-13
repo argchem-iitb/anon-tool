@@ -222,10 +222,58 @@ body {
     pointer-events: none;   /* transparent to clicks unless draw mode is on */
     z-index: 15;
 }
-body.draw-mode .page-drawlayer {
+body.mask-mode .page-drawlayer {
     pointer-events: auto;
     cursor: crosshair;
 }
+body.text-mode .page-drawlayer {
+    pointer-events: auto;
+    cursor: text;
+}
+
+/* ── Custom text boxes ── */
+.text-box {
+    position: absolute;
+    z-index: 18;               /* above the draw layer so inputs stay clickable */
+    pointer-events: auto;
+}
+.text-box-input {
+    display: block;
+    font-family: Helvetica, Arial, sans-serif;
+    color: #000;
+    background: rgba(255, 255, 255, 0.72);
+    border: 1px dashed #1f6feb;
+    border-radius: 2px;
+    padding: 0 2px;
+    margin: 0;
+    line-height: 1.15;
+    outline: none;
+    min-width: 40px;
+}
+.text-box-input:focus { background: #fff; }
+.text-box-bar {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    display: none;
+    gap: 2px;
+    margin-bottom: 3px;
+    white-space: nowrap;
+}
+.text-box:hover .text-box-bar,
+.text-box:focus-within .text-box-bar { display: flex; }
+.text-box-btn {
+    font-size: 11px;
+    line-height: 1;
+    padding: 3px 6px;
+    border: 1px solid #30363d;
+    border-radius: 3px;
+    background: #21262d;
+    color: #c9d1d9;
+    cursor: pointer;
+}
+.text-box-btn:hover { background: #30363d; }
+.text-box-grip { cursor: move; }
 .draw-band {
     position: absolute;
     border: 1.5px dashed #f85149;

@@ -15,8 +15,9 @@
         autoFlaggedSet: new Set(),
         aiFlaggedSet: new Set(),
         manualBoxes: [],          // user-drawn white masks: {id, page, bbox_pt}
+        textBoxes: [],            // user text: {id, page, x_pt, y_pt, text, fontsize}
         renderScale: 150 / 72,    // px-per-point; refined from scan response
-        drawMode: false,
+        activeMode: null,         // null | 'mask' | 'text'
         autoDetectOn: false,
         aiDecisions: null,        // blockId -> {action, reason}
         drawingId: null,
@@ -33,6 +34,7 @@
     const pageInfo = document.getElementById('pageInfo');
     const autoBtn = document.getElementById('autoDetect');
     const maskBtn = document.getElementById('maskBox');
+    const textBtn = document.getElementById('textBox');
     const aiBtn = document.getElementById('aiAnalyze');
     const confirmAIBtn = document.getElementById('confirmAI');
     const aiStatus = document.getElementById('ai-status');
@@ -87,6 +89,12 @@
         });
         (sv.manual_boxes || []).forEach(function (mb, i) {
             state.manualBoxes.push({ id: 'mb_saved_' + i, page: mb.page, bbox_pt: mb.bbox_pt });
+        });
+        (sv.text_boxes || []).forEach(function (t, i) {
+            state.textBoxes.push({
+                id: 'tb_saved_' + i, page: t.page, x_pt: t.x_pt, y_pt: t.y_pt,
+                text: t.text || '', fontsize: t.fontsize || 14,
+            });
         });
 
         if (sv.drawing_id) {
@@ -170,12 +178,16 @@
         }
     });
 
-    // ── Mask Box (draw white boxes over undetected content) ──
-    maskBtn.addEventListener('click', function () {
-        state.drawMode = !state.drawMode;
-        maskBtn.classList.toggle('active', state.drawMode);
-        window.viewer.setDrawMode(state.drawMode);
-    });
+    // ── Placement modes: Mask Box (white boxes) and Text Box (custom text) ──
+    // Mutually exclusive; clicking an active mode turns it off.
+    function setMode(mode) {
+        state.activeMode = (state.activeMode === mode) ? null : mode;
+        maskBtn.classList.toggle('active', state.activeMode === 'mask');
+        textBtn.classList.toggle('active', state.activeMode === 'text');
+        window.viewer.setMode(state.activeMode);
+    }
+    maskBtn.addEventListener('click', function () { setMode('mask'); });
+    textBtn.addEventListener('click', function () { setMode('text'); });
 
     // ── Auto-generate Drawing ID for ANY redaction method ──
     // Fires (debounced) whenever the redaction selection changes, so manually
@@ -185,7 +197,8 @@
         clearTimeout(_metaTimer);
         _metaTimer = setTimeout(function () {
             if (state.metadataExtracted || state.metadataExtracting) return;
-            if (state.redactSet.size > 0 || state.manualBoxes.length > 0) {
+            var hasText = (state.textBoxes || []).some(function (t) { return (t.text || '').trim() !== ''; });
+            if (state.redactSet.size > 0 || state.manualBoxes.length > 0 || hasText) {
                 extractMetadata(false);
             }
         }, 700);
@@ -318,7 +331,8 @@
 
     // ── Process redaction ──
     processBtn.addEventListener('click', async function () {
-        if (state.redactSet.size === 0 && state.manualBoxes.length === 0) return;
+        var textBoxesToPlace = (state.textBoxes || []).filter(function (t) { return (t.text || '').trim() !== ''; });
+        if (state.redactSet.size === 0 && state.manualBoxes.length === 0 && textBoxesToPlace.length === 0) return;
 
         processBtn.disabled = true;
         processBtn.textContent = 'Processing...';
@@ -349,6 +363,11 @@
             return { page: b.page, bbox_pt: b.bbox_pt };
         });
 
+        // Custom text boxes (non-empty only)
+        var textBoxes = textBoxesToPlace.map(function (t) {
+            return { page: t.page, x_pt: t.x_pt, y_pt: t.y_pt, text: t.text, fontsize: t.fontsize };
+        });
+
         // Read metadata from UI fields (user may have edited them)
         var metadata = {
             client_name: document.getElementById('meta-client').value,
@@ -361,6 +380,7 @@
         var payload = {
             blocks: blocksToRedact,
             manual_boxes: manualBoxes,
+            text_boxes: textBoxes,
             drawing_id: state.drawingId || '',
             metadata: metadata,
         };
@@ -376,8 +396,8 @@
             const data = await res.json();
 
             // Show download modal with Drawing ID
-            var totalMasks = blocksToRedact.length + manualBoxes.length;
-            var msg = totalMasks + ' region(s) redacted successfully.';
+            var totalMasks = blocksToRedact.length + manualBoxes.length + textBoxes.length;
+            var msg = totalMasks + ' change(s) applied successfully.';
             if (data.drawing_id) {
                 msg += ' Drawing ID: ' + data.drawing_id;
             }
