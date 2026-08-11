@@ -139,7 +139,14 @@ window.sync = (function () {
         const ids = state.blocks.filter(function (b) {
             if (b.page !== pageNum) return false;
             const bb = b.bbox_pt;
-            return bb[0] < x1 && bb[2] > x0 && bb[1] < y1 && bb[3] > y0;
+            // Require the marquee to cover >=50% of the BLOCK's area — mere
+            // intersection meant grazing a large image (or a long line)
+            // selected the whole thing.
+            const ix = Math.min(bb[2], x1) - Math.max(bb[0], x0);
+            const iy = Math.min(bb[3], y1) - Math.max(bb[1], y0);
+            if (ix <= 0 || iy <= 0) return false;
+            const blockArea = (bb[2] - bb[0]) * (bb[3] - bb[1]);
+            return blockArea <= 0 || (ix * iy) / blockArea >= 0.5;
         }).map(function (b) { return b.id; });
         if (!ids.length) return;
         const anyOff = ids.some(function (id) { return !state.redactSet.has(id); });

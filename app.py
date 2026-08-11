@@ -282,11 +282,18 @@ def _extract_blocks(filepath):
         # drawn image instances. Do NOT use get_image_rects() here — it decodes
         # and MD5-hashes every image on the page per call (O(n^2) decodes; on a
         # 90-image CAD pack that was ~12s of a 14s scan).
+        page_area = rect.width * rect.height
         for b in page_dict["blocks"]:
             if b["type"] != 1:
                 continue
             r = fitz.Rect(b["bbox"])
             if r.is_empty or r.is_infinite:
+                continue
+            # Skip full-page background/template rasters (many CAD exports
+            # draw one under every sheet). Listing them made any selection
+            # grab the ENTIRE page — and let AI flag the whole sheet for
+            # removal. Region masking on scans is what Mask Box is for.
+            if page_area > 0 and (r.width * r.height) / page_area >= 0.85:
                 continue
             bbox_pt = _rect_to_visible([r.x0, r.y0, r.x1, r.y1], rot_mat)
             bbox_px = [round(c * SCALE, 2) for c in bbox_pt]
