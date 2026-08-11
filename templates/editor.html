@@ -20,6 +20,7 @@
         </div>
         <div class="header-right">
             <button id="autoDetect" class="hdr-btn toggle-btn">Auto-Detect PII</button>
+            <button id="areaSelect" class="hdr-btn toggle-btn" title="Drag a rectangle to redact every block inside it">Area Select</button>
             <button id="maskBox" class="hdr-btn toggle-btn" title="Draw white boxes over anything the detector missed">Mask Box</button>
             <button id="textBox" class="hdr-btn toggle-btn" title="Click anywhere on the drawing to place custom text">Text Box</button>
             <button id="aiAnalyze" class="hdr-btn ai-btn">AI Analyze</button>
@@ -56,6 +57,10 @@
         <div id="sidebar">
             <div id="sidebar-header">
                 <input type="text" id="filterInput" placeholder="Filter text blocks..." readonly>
+                <div class="bulk-row">
+                    <button id="bulkRedactShown" class="bulk-btn" title="Redact every block currently shown in the list (respects the filter)">Redact shown</button>
+                    <button id="bulkUndoShown" class="bulk-btn" title="Un-redact every block currently shown in the list">Undo shown</button>
+                </div>
                 <div id="sidebar-stats"></div>
             </div>
 

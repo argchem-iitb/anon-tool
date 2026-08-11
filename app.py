@@ -845,6 +845,15 @@ def page_image(file_id, page_num):
     if not info:
         return "not found", 404
 
+    # Disk cache: rendering big A3 pages at 150 DPI is expensive, and a
+    # multi-page doc used to re-render on every retry/revisit — enough to
+    # OOM the free tier. Uploaded files are immutable per file_id, so a
+    # rendered page never goes stale.
+    cache_dir = os.path.join(app.config["OUTPUT_FOLDER"], "_pagecache")
+    cache_path = os.path.join(cache_dir, f"{file_id}_p{page_num}.png")
+    if os.path.exists(cache_path):
+        return send_file(cache_path, mimetype="image/png", max_age=3600)
+
     doc = fitz.open(info["path"])
     if page_num < 0 or page_num >= len(doc):
         doc.close()
@@ -854,6 +863,15 @@ def page_image(file_id, page_num):
     pix = page.get_pixmap(dpi=RENDER_DPI)
     png_bytes = pix.tobytes("png")
     doc.close()
+
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp = cache_path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(png_bytes)
+        os.replace(tmp, cache_path)
+    except Exception as e:
+        _log(f"[PAGECACHE] write failed: {e}")
 
     return Response(png_bytes, mimetype="image/png",
                     headers={"Cache-Control": "public, max-age=3600"})

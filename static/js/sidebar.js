@@ -156,5 +156,24 @@ window.sidebar = (function () {
         });
     });
 
+    // Bulk actions on the currently shown (filtered) items
+    function _shownIds() {
+        return Object.entries(itemEls)
+            .filter(function (e) { return e[1].style.display !== 'none'; })
+            .map(function (e) { return e[0]; });
+    }
+    var bulkRedactBtn = document.getElementById('bulkRedactShown');
+    var bulkUndoBtn = document.getElementById('bulkUndoShown');
+    if (bulkRedactBtn) {
+        bulkRedactBtn.addEventListener('click', function () {
+            window.sync.bulkSetRedact(_shownIds(), true);
+        });
+    }
+    if (bulkUndoBtn) {
+        bulkUndoBtn.addEventListener('click', function () {
+            window.sync.bulkSetRedact(_shownIds(), false);
+        });
+    }
+
     return { renderList, highlightItem, setRedactState, clearSelection };
 })();

@@ -33,6 +33,7 @@
     const nextBtn = document.getElementById('nextPage');
     const pageInfo = document.getElementById('pageInfo');
     const autoBtn = document.getElementById('autoDetect');
+    const areaBtn = document.getElementById('areaSelect');
     const maskBtn = document.getElementById('maskBox');
     const textBtn = document.getElementById('textBox');
     const aiBtn = document.getElementById('aiAnalyze');
@@ -55,6 +56,7 @@
             state.totalPages = data.total_pages;
             state.blocks = data.blocks;
             state.currentPage = 0;
+            state.pageDims = data.page_dimensions || {};
             if (data.render_dpi) state.renderScale = data.render_dpi / 72;
 
             // If this exact drawing was processed before, restore its Drawing ID
@@ -178,14 +180,17 @@
         }
     });
 
-    // ── Placement modes: Mask Box (white boxes) and Text Box (custom text) ──
+    // ── Placement modes: Area Select (marquee bulk-redact), Mask Box
+    //    (white boxes), Text Box (custom text) ──
     // Mutually exclusive; clicking an active mode turns it off.
     function setMode(mode) {
         state.activeMode = (state.activeMode === mode) ? null : mode;
+        areaBtn.classList.toggle('active', state.activeMode === 'select');
         maskBtn.classList.toggle('active', state.activeMode === 'mask');
         textBtn.classList.toggle('active', state.activeMode === 'text');
         window.viewer.setMode(state.activeMode);
     }
+    areaBtn.addEventListener('click', function () { setMode('select'); });
     maskBtn.addEventListener('click', function () { setMode('mask'); });
     textBtn.addEventListener('click', function () { setMode('text'); });
 
@@ -323,11 +328,17 @@
             }
         } catch (err) {
             console.error('Metadata extraction error:', err);
-            badge.textContent = 'Error';
+            badge.textContent = 'Error — click to retry';
+            badge.title = 'The server call failed (it may have been busy). Click to retry.';
         } finally {
             state.metadataExtracting = false;
         }
     }
+
+    // Error badge is clickable to retry a failed Drawing-ID generation.
+    document.getElementById('drawing-id-badge').addEventListener('click', function () {
+        if (!state.drawingId) extractMetadata(true);
+    });
 
     // ── Process redaction ──
     processBtn.addEventListener('click', async function () {

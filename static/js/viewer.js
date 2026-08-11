@@ -12,8 +12,9 @@ window.viewer = (function () {
     function showLoading() { loading.classList.remove('hidden'); }
     function hideLoading() { loading.classList.add('hidden'); }
 
-    // ── Placement modes: 'mask' (draw white boxes) or 'text' (add text) ──
-    let _activeMode = null;   // null | 'mask' | 'text'
+    // ── Placement modes: 'mask' (white boxes), 'text' (add text),
+    //    'select' (marquee — toggle-redact every block in a dragged area) ──
+    let _activeMode = null;   // null | 'mask' | 'text' | 'select'
     let _mbCounter = 0;
     let _tbCounter = 0;
 
@@ -21,6 +22,7 @@ window.viewer = (function () {
         _activeMode = mode || null;
         document.body.classList.toggle('mask-mode', _activeMode === 'mask');
         document.body.classList.toggle('text-mode', _activeMode === 'text');
+        document.body.classList.toggle('select-mode', _activeMode === 'select');
     }
 
     function rebuildPage(pageNum) {
@@ -118,13 +120,13 @@ window.viewer = (function () {
         }
 
         layer.addEventListener('mousedown', function (e) {
-            if (_activeMode !== 'mask' || e.button !== 0) return;
+            if ((_activeMode !== 'mask' && _activeMode !== 'select') || e.button !== 0) return;
             e.preventDefault();
             const xy = localXY(e);
             startX = xy[0]; startY = xy[1];
             drawing = true;
             band = document.createElement('div');
-            band.className = 'draw-band';
+            band.className = _activeMode === 'select' ? 'draw-band select-band' : 'draw-band';
             band.style.left = startX + 'px';
             band.style.top = startY + 'px';
             layer.appendChild(band);
@@ -157,7 +159,11 @@ window.viewer = (function () {
             const scale = state.renderScale || (150 / 72);
             const f = 1 / (scale * zoom);  // displayed px -> PDF points
             const bbox_pt = [x * f, y * f, (x + w) * f, (y + h) * f];
-            addManualBox(pageNum, bbox_pt);
+            if (_activeMode === 'select') {
+                if (window.sync && window.sync.redactArea) window.sync.redactArea(pageNum, bbox_pt);
+            } else {
+                addManualBox(pageNum, bbox_pt);
+            }
         }
 
         layer.addEventListener('mouseup', finish);
@@ -177,7 +183,102 @@ window.viewer = (function () {
 
     /**
      * Render ALL pages stacked vertically with fit-to-width scaling.
+     *
+     * Pages load LAZILY (as they approach the viewport) with automatic
+     * retries. Firing every page render at once used to crush the server on
+     * multi-page documents — pages 7+ came back broken.
      */
+    function loadPage(pn) {
+        const pe = pageEls[pn];
+        if (!pe || pe.loaded || pe.loading) return;
+        pe.loading = true;
+        const bust = pe.attempts > 0 ? ('?r=' + pe.attempts) : '';
+        pe.img.src = '/api/page-image/' + window.APP_STATE.fileId + '/' + pn + bust;
+    }
+
+    /**
+     * Load every page whose wrapper is within `margin` px of the viewport.
+     * Scroll-position based (NOT IntersectionObserver — IO is throttled to
+     * uselessness in background tabs and embedded webviews, which left far
+     * pages permanently unloaded).
+     */
+    function _checkVisiblePages() {
+        const rootRect = scrollEl.getBoundingClientRect();
+        const margin = 800;
+        Object.keys(pageEls).forEach(function (pn) {
+            const pe = pageEls[pn];
+            if (pe.loaded || pe.loading) return;
+            const r = pe.wrapper.getBoundingClientRect();
+            if (r.bottom > rootRect.top - margin && r.top < rootRect.bottom + margin) {
+                loadPage(parseInt(pn));
+            }
+        });
+    }
+
+    let _lazyTimer = null;
+    let _lazyInterval = null;
+    function _scheduleLazyCheck() {
+        if (_lazyTimer) return;
+        _lazyTimer = setTimeout(function () {
+            _lazyTimer = null;
+            _checkVisiblePages();
+        }, 150);
+    }
+
+    function _removeRetryNotice(pe) {
+        const n = pe.inner.querySelector('.page-retry');
+        if (n) n.parentNode.removeChild(n);
+    }
+
+    function _showRetryNotice(pe, pn) {
+        _removeRetryNotice(pe);
+        const box = document.createElement('div');
+        box.className = 'page-retry';
+        const msg = document.createElement('span');
+        msg.textContent = 'Page ' + (pn + 1) + ' failed to load.';
+        const btn = document.createElement('button');
+        btn.className = 'hdr-btn';
+        btn.textContent = 'Retry';
+        btn.addEventListener('click', function () {
+            pe.attempts = 0;
+            _removeRetryNotice(pe);
+            loadPage(pn);
+        });
+        box.appendChild(msg);
+        box.appendChild(btn);
+        pe.inner.appendChild(box);
+    }
+
+    function _setupLazyLoading() {
+        const state = window.APP_STATE;
+        loadPage(0);  // first page always loads immediately
+
+        if (state.totalPages <= 3 || scrollEl.clientHeight <= 50) {
+            // Small docs (or environments without a real viewport): eager load.
+            for (let pn = 1; pn < state.totalPages; pn++) loadPage(pn);
+            return;
+        }
+        scrollEl.addEventListener('scroll', _scheduleLazyCheck);
+        window.addEventListener('resize', _scheduleLazyCheck);
+        _checkVisiblePages();
+
+        // Safety net: scroll events can be throttled/suppressed (background
+        // tabs, embedded webviews). Poll proximity until every page has
+        // loaded, then stop — guarantees progress without event delivery.
+        if (_lazyInterval) clearInterval(_lazyInterval);
+        _lazyInterval = setInterval(function () {
+            const pending = Object.values(pageEls).some(function (pe) {
+                return !pe.loaded && pe.attempts <= 3;
+            });
+            if (!pending) {
+                clearInterval(_lazyInterval);
+                _lazyInterval = null;
+                return;
+            }
+            _checkVisiblePages();
+        }, 900);
+    }
+
     function renderAllPages() {
         const state = window.APP_STATE;
         container.innerHTML = '';
@@ -185,8 +286,8 @@ window.viewer = (function () {
 
         showLoading();
 
-        let loadedCount = 0;
         const totalPages = state.totalPages;
+        const availWidth = Math.max(scrollEl.clientWidth - 60, 100);
 
         for (let pageNum = 0; pageNum < totalPages; pageNum++) {
             (function (pn) {
@@ -195,10 +296,20 @@ window.viewer = (function () {
                 wrapper.className = 'page-wrapper';
                 wrapper.dataset.page = pn;
 
-                // Page label (outside the relative container)
+                // Page label row (page number + bulk redact-page button)
                 const label = document.createElement('div');
                 label.className = 'page-label';
-                label.textContent = 'Page ' + (pn + 1) + ' / ' + totalPages;
+                const labelText = document.createElement('span');
+                labelText.textContent = 'Page ' + (pn + 1) + ' / ' + totalPages;
+                label.appendChild(labelText);
+                const pageBtn = document.createElement('button');
+                pageBtn.className = 'page-redact-btn';
+                pageBtn.textContent = 'Redact page';
+                pageBtn.title = 'Toggle redaction for every detected block on this page';
+                pageBtn.addEventListener('click', function () {
+                    if (window.sync && window.sync.redactPage) window.sync.redactPage(pn);
+                });
+                label.appendChild(pageBtn);
 
                 // Inner container (position: relative — holds image + overlay)
                 const inner = document.createElement('div');
@@ -213,37 +324,63 @@ window.viewer = (function () {
                 const overlay = document.createElement('div');
                 overlay.className = 'page-overlay';
 
-                // Draw layer (captures drag-to-mask only when draw mode is on)
+                // Draw layer (captures drag interactions when a mode is active)
                 const drawlayer = document.createElement('div');
                 drawlayer.className = 'page-drawlayer';
                 attachDrawHandlers(pn, drawlayer);
 
                 pageEls[pn] = {
-                    wrapper: wrapper, img: img, overlay: overlay,
+                    wrapper: wrapper, inner: inner, img: img, overlay: overlay,
                     drawlayer: drawlayer, bboxEls: {},
+                    loaded: false, loading: false, attempts: 0,
                 };
 
+                // Reserve space from the known page dimensions so lazy pages
+                // keep their height and the scrollbar stays truthful.
+                const dims = (state.pageDims || {})[String(pn)];
+                if (dims) {
+                    const estZoom = Math.max(0.05, Math.min(1, availWidth / (dims.width_pt * state.renderScale)));
+                    inner.style.minHeight = Math.round(dims.height_pt * state.renderScale * estZoom) + 'px';
+                    inner.style.minWidth = Math.round(dims.width_pt * state.renderScale * estZoom) + 'px';
+                }
+
                 img.onload = function () {
+                    const pe = pageEls[pn];
+                    pe.loaded = true;
+                    pe.loading = false;
+                    pe.attempts = 0;
+                    inner.style.minHeight = '';
+                    inner.style.minWidth = '';
+                    _removeRetryNotice(pe);
+
                     // Fit to available width
-                    var availWidth = scrollEl.clientWidth - 60;
-                    var zoom = Math.max(0.05, Math.min(1, availWidth / img.naturalWidth));
+                    var availW = Math.max(scrollEl.clientWidth - 60, 100);
+                    var zoom = Math.max(0.05, Math.min(1, availW / img.naturalWidth));
                     wrapper.dataset.zoom = zoom;
                     img.style.width = (img.naturalWidth * zoom) + 'px';
                     img.style.height = (img.naturalHeight * zoom) + 'px';
 
                     buildPageOverlay(pn, zoom);
 
-                    loadedCount++;
-                    if (loadedCount === totalPages) {
-                        hideLoading();
-                    }
+                    // The editor is usable as soon as the first page is in.
+                    hideLoading();
+                    // Loading a page changes layout heights — re-check which
+                    // neighbors are now in range (chain-loads when parked).
+                    _scheduleLazyCheck();
                 };
                 img.onerror = function () {
-                    loadedCount++;
-                    if (loadedCount === totalPages) hideLoading();
+                    const pe = pageEls[pn];
+                    if (!pe.loading) return;   // spurious (e.g. empty src)
+                    pe.loading = false;
+                    pe.attempts++;
+                    if (pe.attempts <= 3) {
+                        // Back off and retry — transient server pressure heals.
+                        setTimeout(function () { loadPage(pn); }, 700 * Math.pow(2, pe.attempts - 1));
+                    } else {
+                        hideLoading();
+                        _showRetryNotice(pe, pn);
+                    }
                 };
-
-                img.src = '/api/page-image/' + state.fileId + '/' + pn;
 
                 inner.appendChild(img);
                 inner.appendChild(overlay);
@@ -253,6 +390,8 @@ window.viewer = (function () {
                 container.appendChild(wrapper);
             })(pageNum);
         }
+
+        _setupLazyLoading();
     }
 
     /**
@@ -265,6 +404,10 @@ window.viewer = (function () {
 
         pe.overlay.innerHTML = '';
         pe.bboxEls = {};
+
+        // Lazy pages have no image yet — their zoom is unknown, so boxes
+        // would land at the wrong scale. Overlays build on img.onload.
+        if (!pe.loaded) return;
 
         const pageBlocks = state.blocks.filter(function (b) { return b.page === pageNum; });
 
@@ -490,6 +633,7 @@ window.viewer = (function () {
     function scrollToPage(pageNum) {
         var pe = pageEls[pageNum];
         if (pe) {
+            loadPage(pageNum);   // jumping can outrun the lazy observer
             pe.wrapper.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
     }

@@ -93,6 +93,60 @@ window.sync = (function () {
     }
 
     /**
+     * Bulk-set redaction for many blocks at once, with a SINGLE view refresh
+     * (per-block toggling rebuilds the sidebar each time — unusable at
+     * 1000+ blocks).
+     */
+    function bulkSetRedact(blockIds, on) {
+        const state = window.APP_STATE;
+        blockIds.forEach(function (id) {
+            if (on) {
+                state.redactSet.add(id);
+                state.manualRedactSet.add(id);
+            } else {
+                state.redactSet.delete(id);
+                state.manualRedactSet.delete(id);
+                state.autoFlaggedSet.delete(id);
+                state.aiFlaggedSet.delete(id);
+            }
+        });
+        refreshView();
+        updateRedactCount();
+    }
+
+    /**
+     * Toggle redaction for every detected block on a page: if all are
+     * already redacted, un-redact the page; otherwise redact everything.
+     */
+    function redactPage(pageNum) {
+        const state = window.APP_STATE;
+        const ids = state.blocks
+            .filter(function (b) { return b.page === pageNum; })
+            .map(function (b) { return b.id; });
+        if (!ids.length) return;
+        const allOn = ids.every(function (id) { return state.redactSet.has(id); });
+        bulkSetRedact(ids, !allOn);
+    }
+
+    /**
+     * Marquee (Area Select): toggle-redact every block intersecting the
+     * dragged rectangle (visible-space pt coords). If any block in the area
+     * is unredacted, redact them all; if all are redacted, undo them.
+     */
+    function redactArea(pageNum, rect) {
+        const state = window.APP_STATE;
+        const x0 = rect[0], y0 = rect[1], x1 = rect[2], y1 = rect[3];
+        const ids = state.blocks.filter(function (b) {
+            if (b.page !== pageNum) return false;
+            const bb = b.bbox_pt;
+            return bb[0] < x1 && bb[2] > x0 && bb[1] < y1 && bb[3] > y0;
+        }).map(function (b) { return b.id; });
+        if (!ids.length) return;
+        const anyOff = ids.some(function (id) { return !state.redactSet.has(id); });
+        bulkSetRedact(ids, anyOff);
+    }
+
+    /**
      * Re-render all page overlays and sidebar to reflect state changes.
      */
     function refreshView() {
@@ -120,6 +174,9 @@ window.sync = (function () {
     return {
         selectBlock,
         toggleRedact,
+        bulkSetRedact,
+        redactPage,
+        redactArea,
         enableAutoDetect,
         disableAutoDetect,
         applyAISuggestions,
