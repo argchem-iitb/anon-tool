@@ -6,6 +6,7 @@ import uuid
 import math
 import zipfile
 import hashlib
+import concurrent.futures
 
 
 def _load_dotenv():
@@ -202,7 +203,7 @@ def _extract_blocks(filepath):
         # --- Text: extract at line level for fine granularity ---
         page_dict = page.get_text("dict")
         for b in page_dict["blocks"]:
-            if b["type"] != 0:       # skip image blocks from dict
+            if b["type"] != 0:       # image blocks handled below
                 continue
             for line in b["lines"]:
                 text = _join_spans(line["spans"])
@@ -277,28 +278,29 @@ def _extract_blocks(filepath):
             _log(f"[LOGO] vector scan failed p{page_num}: {_e}")
 
         # --- Embedded images (logos, stamps, etc.) ---
-        for img_info in page.get_images(full=True):
-            xref = img_info[0]
-            try:
-                rects = page.get_image_rects(xref)
-            except Exception:
+        # Bboxes come from the get_text('dict') pass above: type-1 blocks are
+        # drawn image instances. Do NOT use get_image_rects() here — it decodes
+        # and MD5-hashes every image on the page per call (O(n^2) decodes; on a
+        # 90-image CAD pack that was ~12s of a 14s scan).
+        for b in page_dict["blocks"]:
+            if b["type"] != 1:
                 continue
-            for r in rects:
-                if r.is_empty or r.is_infinite:
-                    continue
-                bbox_pt = _rect_to_visible([r.x0, r.y0, r.x1, r.y1], rot_mat)
-                bbox_px = [round(c * SCALE, 2) for c in bbox_pt]
-                block_id = f"p{page_num}_b{idx}"
-                blocks.append({
-                    "id": block_id,
-                    "page": page_num,
-                    "bbox_pt": bbox_pt,
-                    "bbox_px": bbox_px,
-                    "text": "[IMAGE]",
-                    "is_image": True,
-                    "pii_flags": [],
-                })
-                idx += 1
+            r = fitz.Rect(b["bbox"])
+            if r.is_empty or r.is_infinite:
+                continue
+            bbox_pt = _rect_to_visible([r.x0, r.y0, r.x1, r.y1], rot_mat)
+            bbox_px = [round(c * SCALE, 2) for c in bbox_pt]
+            block_id = f"p{page_num}_b{idx}"
+            blocks.append({
+                "id": block_id,
+                "page": page_num,
+                "bbox_pt": bbox_pt,
+                "bbox_px": bbox_px,
+                "text": "[IMAGE]",
+                "is_image": True,
+                "pii_flags": [],
+            })
+            idx += 1
 
     doc.close()
     return total_pages, page_dims, blocks
@@ -891,22 +893,28 @@ def analyze(file_id):
 
     context_objects = _build_context_objects(blocks)
 
-    # Batch into chunks of 15 to stay within token limits
-    all_decisions = []
+    # Batch into chunks of 15 to stay within token limits, and run batches
+    # CONCURRENTLY: a dense 10-sheet pack is ~90 batches, which sequentially
+    # is 2-5 minutes — past the 180s gunicorn timeout on Render. 5 workers
+    # brings it to ~30-60s. Batches are independent; order is preserved.
     batch_size = 15
-    for i in range(0, len(context_objects), batch_size):
-        batch = context_objects[i:i + batch_size]
+    batches = [context_objects[i:i + batch_size]
+               for i in range(0, len(context_objects), batch_size)]
+
+    def _run_batch(batch):
         try:
-            decisions = _call_gemini(batch)
-            all_decisions.extend(decisions)
+            return _call_gemini(batch)
         except Exception as e:
-            # On failure, mark the batch as "keep" with error reason
-            for obj in batch:
-                all_decisions.append({
-                    "id": obj["id"],
-                    "action": "keep",
-                    "reason": f"AI error: {str(e)[:50]}",
-                })
+            return [{
+                "id": obj["id"],
+                "action": "keep",
+                "reason": f"AI error: {str(e)[:50]}",
+            } for obj in batch]
+
+    all_decisions = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+        for decisions in pool.map(_run_batch, batches):
+            all_decisions.extend(decisions)
 
     return jsonify({"decisions": all_decisions})
 
@@ -1099,6 +1107,38 @@ def redact(file_id):
             )
         except Exception as e:
             _log(f"[TEXTBOX] place failed: {e}")
+
+    # Step 2.7: Recompress images that redaction inflated. IMAGE_PIXELS
+    # re-encodes touched images as raw/Flate, which ballooned a 13 MB pack
+    # to 31 MB. Re-encode any large non-JPEG image to JPEG q80 (grayscale/RGB
+    # only — the white redaction fill is already burned into the pixels).
+    try:
+        seen_xrefs = set()
+        for pg in doc:
+            for img_info in pg.get_images(full=True):
+                xref = img_info[0]
+                if xref in seen_xrefs:
+                    continue
+                seen_xrefs.add(xref)
+                try:
+                    raw = doc.xref_stream_raw(xref)
+                    if raw is None or len(raw) < 300_000:
+                        continue
+                    filt = doc.xref_get_key(xref, "Filter")[1] or ""
+                    if "DCT" in filt or "JPX" in filt:
+                        continue  # already compressed
+                    pix = fitz.Pixmap(doc, xref)
+                    if pix.alpha:               # JPEG can't carry alpha
+                        pix = fitz.Pixmap(pix, 0)
+                    if pix.n > 3:               # CMYK etc. -> RGB
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    jpg = pix.tobytes("jpg", jpg_quality=80)
+                    if len(jpg) < len(raw) * 0.8:
+                        pg.replace_image(xref, stream=jpg)
+                except Exception as e:
+                    _log(f"[SHRINK] xref {xref}: {e}")
+    except Exception as e:
+        _log(f"[SHRINK] pass failed: {e}")
 
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
