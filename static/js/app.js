@@ -403,7 +403,12 @@
                 body: JSON.stringify(payload),
             });
 
-            if (!res.ok) throw new Error('Redaction failed');
+            if (!res.ok) {
+                var detail = '';
+                try { detail = (await res.text()).slice(0, 120); } catch (e) {}
+                throw new Error('HTTP ' + res.status + (detail ? ' — ' + detail : '') +
+                    (res.status === 502 ? ' (server ran out of memory or restarted)' : ''));
+            }
             const data = await res.json();
 
             // Show download modal with Drawing ID
@@ -414,6 +419,9 @@
             }
             if (data.sheets_error) {
                 msg += ' (Sheets sync error: ' + data.sheets_error + ')';
+            }
+            if (data.warnings && data.warnings.length) {
+                msg += '\n⚠ ' + data.warnings.join('\n⚠ ');
             }
             modalMsg.textContent = msg;
             downloadLink.href = data.download_url;
@@ -430,7 +438,7 @@
             modal.classList.remove('hidden');
         } catch (err) {
             console.error('Redaction error:', err);
-            alert('Redaction failed. Please try again.');
+            alert('Redaction failed: ' + err.message + '\nYour selection is preserved — try again.');
         } finally {
             processBtn.disabled = false;
             processBtn.textContent = 'Process Redaction';

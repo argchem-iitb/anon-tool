@@ -1015,6 +1015,62 @@ def extract_metadata(file_id):
     })
 
 
+def _flatten_monster_images(doc, page, mp_threshold, dpi=200):
+    """Truly scrub oversized rasters on an already-redacted page.
+
+    Directly decoding a 20-40 MP embedded image (~60-130 MB RGB) OOM-kills the
+    512 MB Render instance. Rendering the PAGE instead is memory-safe (MuPDF
+    subsample-decodes JPEGs when drawing scaled), so: render the page with its
+    white redaction fills baked in, delete the monster image objects, and put
+    the render underneath the remaining (vector) content. Returns True when
+    every monster on the page was removed.
+    """
+    big = []
+    for im in page.get_images(full=True):
+        xref = im[0]
+        try:
+            w = int(doc.xref_get_key(xref, "Width")[1] or 0)
+            h = int(doc.xref_get_key(xref, "Height")[1] or 0)
+        except Exception:
+            continue
+        if w * h / 1e6 > mp_threshold:
+            big.append(xref)
+    if not big:
+        return True
+
+    # An xref shared with another page can't be deleted safely from here.
+    shared = set()
+    for pno in range(len(doc)):
+        if pno == page.number:
+            continue
+        for im in doc[pno].get_images(full=True):
+            if im[0] in big:
+                shared.add(im[0])
+
+    pix = page.get_pixmap(dpi=dpi)
+    flat_jpg = pix.tobytes("jpg", jpg_quality=80)
+    pix = None
+
+    removed = 0
+    for xref in big:
+        if xref in shared:
+            continue
+        try:
+            page.delete_image(xref)
+            removed += 1
+        except Exception as e:
+            _log(f"[FLATTEN] delete xref {xref} failed: {e}")
+    if removed:
+        # Underlay the flattened render; surviving vector content (already
+        # redacted) draws on top of it, visually unchanged.
+        page.insert_image(page.rect, stream=flat_jpg, overlay=False)
+    try:
+        fitz.TOOLS.store_shrink(100)
+    except Exception:
+        pass
+    return removed == len(big)
+
+
 @app.route("/api/redact/<file_id>", methods=["POST"])
 def redact(file_id):
     info = FILE_REGISTRY.get(file_id)
@@ -1056,6 +1112,26 @@ def redact(file_id):
         except (KeyError, TypeError, ValueError):
             continue
 
+    # Pixel-scrubbing decodes every image a redaction box touches. Some CAD
+    # exports embed 20-40+ megapixel rasters (>100 MB decoded EACH) — decoding
+    # those OOM-kills the 512 MB Render instance (worker dies, browser sees a
+    # bare 502). Pages carrying such monsters get cover-only treatment for
+    # images; text/vector content is still genuinely deleted either way (the
+    # `images` mode only governs raster pixels).
+    MAX_SCRUB_MEGAPIXELS = 12  # ~36 MB decoded RGB; typical 150-dpi scans are ~4 MP
+
+    def _page_max_megapixels(page):
+        mx = 0.0
+        for im in page.get_images(full=True):
+            try:
+                w = int(doc.xref_get_key(im[0], "Width")[1] or 0)
+                h = int(doc.xref_get_key(im[0], "Height")[1] or 0)
+                mx = max(mx, w * h / 1e6)
+            except Exception:
+                continue
+        return mx
+
+    redact_warnings = []
     for page_num, entries in pages_map.items():
         page = doc[page_num]
         page_rect = page.rect             # visible bounds
@@ -1069,16 +1145,50 @@ def redact(file_id):
             rect = rect * derot           # back to unrotated space for the annot
             rect.normalize()
             page.add_redact_annot(rect, fill=(1, 1, 1))  # white fill
+
+        scrub_ok = _page_max_megapixels(page) <= MAX_SCRUB_MEGAPIXELS
         # IMAGE_PIXELS blanks only the pixels UNDER each box — critical for
         # scanned/flattened drawings that are one full-page image (IMAGE_REMOVE
         # would delete the whole image and blank the page). LINE_ART_REMOVE_IF_
         # COVERED drops only vector art fully inside a box (e.g. a logo) while
         # keeping border/geometry lines that merely cross it. The white fill
         # still visually covers each redacted region.
-        page.apply_redactions(
-            images=fitz.PDF_REDACT_IMAGE_PIXELS,
-            graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
-        )
+        try:
+            page.apply_redactions(
+                images=fitz.PDF_REDACT_IMAGE_PIXELS if scrub_ok else fitz.PDF_REDACT_IMAGE_NONE,
+                graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+            )
+            if not scrub_ok:
+                # Monster rasters: truly scrub by FLATTENING — render the
+                # already-redacted page at bounded DPI (page rendering uses
+                # MuPDF's subsampled JPEG decode, so memory stays low) and
+                # swap the oversized originals for that render.
+                _log(f"[REDACT] p{page_num}: >{MAX_SCRUB_MEGAPIXELS}MP raster; flattening")
+                if not _flatten_monster_images(doc, page, MAX_SCRUB_MEGAPIXELS):
+                    redact_warnings.append(
+                        f"Page {page_num + 1}: contains a very large raster — "
+                        f"regions are covered and text removed, but raster "
+                        f"pixels underneath could not be scrubbed")
+        except Exception as e:
+            # Exotic image codecs can make the pixel-scrub throw. Fall back to
+            # covering without touching image pixels, and SAY SO.
+            _log(f"[REDACT] pixel-scrub failed p{page_num}: {e}; falling back to cover-only")
+            try:
+                page.apply_redactions(
+                    images=fitz.PDF_REDACT_IMAGE_NONE,
+                    graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                )
+                redact_warnings.append(
+                    f"Page {page_num + 1}: image pixels could not be scrubbed "
+                    f"(covered visually only)")
+            except Exception as e2:
+                _log(f"[REDACT] cover-only also failed p{page_num}: {e2}")
+                redact_warnings.append(f"Page {page_num + 1}: redaction failed")
+        # Free MuPDF's decoded-image cache between heavy pages.
+        try:
+            fitz.TOOLS.store_shrink(100)
+        except Exception:
+            pass
 
     # Step 2: Overlay "Mechximize" + Drawing ID on the title block.
     # Requires detected title-block text blocks to anchor to — skipped when
@@ -1121,7 +1231,8 @@ def redact(file_id):
     # only — the white redaction fill is already burned into the pixels).
     try:
         seen_xrefs = set()
-        for pg in doc:
+        for page_num in pages_map:      # only pages redaction touched can inflate
+            pg = doc[page_num]
             for img_info in pg.get_images(full=True):
                 xref = img_info[0]
                 if xref in seen_xrefs:
@@ -1134,16 +1245,25 @@ def redact(file_id):
                     filt = doc.xref_get_key(xref, "Filter")[1] or ""
                     if "DCT" in filt or "JPX" in filt:
                         continue  # already compressed
+                    w = int(doc.xref_get_key(xref, "Width")[1] or 0)
+                    h = int(doc.xref_get_key(xref, "Height")[1] or 0)
+                    if w * h / 1e6 > MAX_SCRUB_MEGAPIXELS:
+                        continue  # never decode monster rasters here either
                     pix = fitz.Pixmap(doc, xref)
                     if pix.alpha:               # JPEG can't carry alpha
                         pix = fitz.Pixmap(pix, 0)
                     if pix.n > 3:               # CMYK etc. -> RGB
                         pix = fitz.Pixmap(fitz.csRGB, pix)
                     jpg = pix.tobytes("jpg", jpg_quality=80)
+                    pix = None
                     if len(jpg) < len(raw) * 0.8:
                         pg.replace_image(xref, stream=jpg)
                 except Exception as e:
                     _log(f"[SHRINK] xref {xref}: {e}")
+            try:
+                fitz.TOOLS.store_shrink(100)
+            except Exception:
+                pass
     except Exception as e:
         _log(f"[SHRINK] pass failed: {e}")
 
@@ -1192,6 +1312,7 @@ def redact(file_id):
         "download_url": url_for("download", file_id=file_id),
         "drawing_id": drawing_id,
         "sheets_error": sheets_error,
+        "warnings": redact_warnings,
     })
 
 

@@ -564,6 +564,7 @@ body.select-mode .page-drawlayer {
     color: #8b949e;
     margin-bottom: 20px;
     font-size: 14px;
+    white-space: pre-line;   /* render per-page warning lines */
 }
 .modal-content a {
     display: inline-block;
