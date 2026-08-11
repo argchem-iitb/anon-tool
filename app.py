@@ -165,12 +165,23 @@ def _join_spans(spans):
     return "".join(parts).strip()
 
 
+def _rect_to_visible(bbox, matrix):
+    """Map an unrotated PDF rect (the space get_text / get_drawings /
+    get_image_rects report in) into the VISIBLE space of the rendered pixmap,
+    via the page's rotation matrix. Without this, overlay/redaction boxes are
+    misaligned on rotated PDFs (mask drawn at X lands at Y)."""
+    r = fitz.Rect(bbox) * matrix
+    r.normalize()
+    return [r.x0, r.y0, r.x1, r.y1]
+
+
 def _extract_blocks(filepath):
     """Extract all text lines and embedded images from PDF.
 
     Uses get_text('dict') for line-level granularity so that title-block
     cells are individual items even when the PDF merges them into one
-    large text block.
+    large text block. All bboxes are returned in VISIBLE (rendered) space so
+    they line up with the page image even when the PDF page is rotated.
     """
     doc = fitz.open(filepath)
     total_pages = len(doc)
@@ -179,7 +190,8 @@ def _extract_blocks(filepath):
 
     for page_num in range(total_pages):
         page = doc[page_num]
-        rect = page.rect
+        rect = page.rect          # already reflects rotation (visible size)
+        rot_mat = page.rotation_matrix  # unrotated content -> visible
         page_dims[str(page_num)] = {
             "width_pt": rect.width,
             "height_pt": rect.height,
@@ -196,8 +208,7 @@ def _extract_blocks(filepath):
                 text = _join_spans(line["spans"])
                 if not text:
                     continue
-                bbox = line["bbox"]
-                bbox_pt = [bbox[0], bbox[1], bbox[2], bbox[3]]
+                bbox_pt = _rect_to_visible(line["bbox"], rot_mat)
                 bbox_px = [round(c * SCALE, 2) for c in bbox_pt]
                 block_id = f"p{page_num}_b{idx}"
                 blocks.append({
@@ -250,7 +261,7 @@ def _extract_blocks(filepath):
                 count = sum(1 for r in colored_rects if c.contains(r))
                 if count < 4:
                     continue
-                bbox_pt = [c.x0, c.y0, c.x1, c.y1]
+                bbox_pt = _rect_to_visible([c.x0, c.y0, c.x1, c.y1], rot_mat)
                 bbox_px = [round(v * SCALE, 2) for v in bbox_pt]
                 blocks.append({
                     "id": f"p{page_num}_b{idx}",
@@ -275,7 +286,7 @@ def _extract_blocks(filepath):
             for r in rects:
                 if r.is_empty or r.is_infinite:
                     continue
-                bbox_pt = [r.x0, r.y0, r.x1, r.y1]
+                bbox_pt = _rect_to_visible([r.x0, r.y0, r.x1, r.y1], rot_mat)
                 bbox_px = [round(c * SCALE, 2) for c in bbox_pt]
                 block_id = f"p{page_num}_b{idx}"
                 blocks.append({
@@ -489,9 +500,18 @@ def _overlay_new_labels(doc, redact_blocks, drawing_id, scan_blocks=None, metada
 
     fontname = "helv"
     color_black = (0, 0, 0)
+    # Bboxes here are VISIBLE coords; insert_text works in unrotated space, so
+    # derotate each point and rotate the glyphs to stay upright on rotated pages.
+    derot = page.derotation_matrix
+    prot = page.rotation
+
+    def _put_text(px, py, text, fontsize):
+        p = fitz.Point(px, py) * derot
+        page.insert_text(p, text, fontsize=fontsize, fontname=fontname,
+                         color=color_black, rotate=prot)
 
     def _place_text_in_bbox(bbox, text, fontsize):
-        """Place text centered inside a bbox."""
+        """Place text centered inside a bbox (visible coords)."""
         x0, y0, x1, y1 = bbox
         box_w = x1 - x0
         box_h = y1 - y0
@@ -502,10 +522,7 @@ def _overlay_new_labels(doc, redact_blocks, drawing_id, scan_blocks=None, metada
             tw = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
         px = x0 + (box_w - tw) / 2
         py = y0 + (box_h + fontsize) / 2
-        page.insert_text(
-            fitz.Point(px, py), text,
-            fontsize=fontsize, fontname=fontname, color=color_black,
-        )
+        _put_text(px, py, text, fontsize)
 
     def _find_removed_block_by_text(search_text):
         """Find a removed block containing the given text."""
@@ -597,12 +614,10 @@ def _overlay_new_labels(doc, redact_blocks, drawing_id, scan_blocks=None, metada
             cy = (tb_y0 + tb_y1) / 2
             if not placed_company:
                 tw = fitz.get_text_length("Mechximize", fontname=fontname, fontsize=12)
-                page.insert_text(fitz.Point(cx - tw / 2, cy - 5), "Mechximize",
-                                 fontsize=12, fontname=fontname, color=color_black)
+                _put_text(cx - tw / 2, cy - 5, "Mechximize", 12)
             if not placed_id:
                 tw = fitz.get_text_length(drawing_id, fontname=fontname, fontsize=10)
-                page.insert_text(fitz.Point(cx - tw / 2, cy + 12), drawing_id,
-                                 fontsize=10, fontname=fontname, color=color_black)
+                _put_text(cx - tw / 2, cy + 12, drawing_id, 10)
 
 
 # ──────────────────────────── pages ────────────────────────────
@@ -1010,13 +1025,16 @@ def redact(file_id):
 
     for page_num, entries in pages_map.items():
         page = doc[page_num]
-        page_rect = page.rect
+        page_rect = page.rect             # visible bounds
+        derot = page.derotation_matrix    # visible -> unrotated (identity if rot 0)
         for bbox, pad in entries:
-            rect = fitz.Rect(bbox)
+            rect = fitz.Rect(bbox)        # VISIBLE coords (match the rendered image)
             rect.x0 = max(rect.x0 - pad, page_rect.x0)
             rect.y0 = max(rect.y0 - pad, page_rect.y0)
             rect.x1 = min(rect.x1 + pad, page_rect.x1)
             rect.y1 = min(rect.y1 + pad, page_rect.y1)
+            rect = rect * derot           # back to unrotated space for the annot
+            rect.normalize()
             page.add_redact_annot(rect, fill=(1, 1, 1))  # white fill
         # IMAGE_PIXELS blanks only the pixels UNDER each box — critical for
         # scanned/flattened drawings that are one full-page image (IMAGE_REMOVE
@@ -1052,11 +1070,14 @@ def redact(file_id):
             fs = float(tb.get("fontsize", 14)) or 14.0
             x = float(tb.get("x_pt", 0))
             y = float(tb.get("y_pt", 0))
-            # y is the text TOP (matching the editor preview); insert_text anchors
-            # at the baseline, so drop by ~cap height.
-            doc[pg].insert_text(
-                fitz.Point(x, y + fs * 0.85), txt,
-                fontsize=fs, fontname="helv", color=(0, 0, 0),
+            page = doc[pg]
+            # (x, y) is the VISIBLE text top (matching the editor); insert_text
+            # anchors at the baseline, so drop by ~cap height. Derotate the point
+            # and rotate the glyphs so text stays upright on rotated pages.
+            p_un = fitz.Point(x, y + fs * 0.85) * page.derotation_matrix
+            page.insert_text(
+                p_un, txt, fontsize=fs, fontname="helv", color=(0, 0, 0),
+                rotate=page.rotation,
             )
         except Exception as e:
             _log(f"[TEXTBOX] place failed: {e}")
