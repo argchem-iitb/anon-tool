@@ -268,37 +268,67 @@ body.select-mode .page-drawlayer {
     background: rgba(88, 166, 255, 0.12) !important;
 }
 
-/* ── Custom text boxes ── */
+/* ── Custom text boxes (+ the Mechximize / Drawing ID labels) ── */
 .text-box {
     position: absolute;
-    z-index: 18;               /* above the draw layer so inputs stay clickable */
+    z-index: 22;               /* above the draw layer AND a selected bbox (20),
+                                  so a box is always clickable to edit */
     pointer-events: auto;
 }
+.text-box-active,
+.text-box-dragging { z-index: 23; }
 .text-box-input {
     display: block;
-    font-family: Helvetica, Arial, sans-serif;
+    /* Metric-compatible with the PDF's Helvetica; line height and zero
+       padding/border match TEXT_LINE_HEIGHT / TEXT_BASELINE in app.py, so the
+       text's top-left here is exactly the point the PDF uses. */
+    font-family: Arial, Helvetica, sans-serif;
+    line-height: 1.2;
     color: #000;
     background: rgba(255, 255, 255, 0.72);
-    border: 1px dashed #1f6feb;
-    border-radius: 2px;
-    padding: 0 2px;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
     margin: 0;
-    line-height: 1.15;
-    outline: none;
-    min-width: 40px;
+    outline: 1px dashed #1f6feb;    /* outline takes no layout space */
+    outline-offset: 1px;
+    resize: none;
+    overflow: hidden;
+    white-space: pre;
 }
-.text-box-input:focus { background: #fff; }
+.text-box-active .text-box-input {
+    background: #fff;
+    outline: 2px solid #1f6feb;
+}
+.text-box-label .text-box-input {
+    outline-color: #238636;
+    cursor: move;
+    user-select: none;
+    touch-action: none;        /* touch drags move the label, not the page */
+}
+.text-box-label.text-box-active .text-box-input { outline: 2px solid #238636; }
 .text-box-bar {
     position: absolute;
     bottom: 100%;
     left: 0;
     display: none;
+    align-items: center;
     gap: 2px;
-    margin-bottom: 3px;
+    margin-bottom: 4px;
     white-space: nowrap;
 }
 .text-box:hover .text-box-bar,
-.text-box:focus-within .text-box-bar { display: flex; }
+.text-box-active .text-box-bar,
+.text-box-dragging .text-box-bar { display: flex; }
+.text-box-tag {
+    font-size: 10px;
+    line-height: 1;
+    padding: 4px 6px;
+    border-radius: 3px;
+    background: #238636;
+    color: #fff;
+    font-weight: 600;
+}
 .text-box-btn {
     font-size: 11px;
     line-height: 1;
@@ -310,7 +340,7 @@ body.select-mode .page-drawlayer {
     cursor: pointer;
 }
 .text-box-btn:hover { background: #30363d; }
-.text-box-grip { cursor: move; }
+.text-box-grip { cursor: move; touch-action: none; }
 .draw-band {
     position: absolute;
     border: 1.5px dashed #f85149;
@@ -603,6 +633,104 @@ body.select-mode .page-drawlayer {
     color: #fff;
     font-weight: 700;
 }
+/* Drawing ID: fresh ID vs revision of an existing drawing */
+.id-mode {
+    display: flex;
+    margin-bottom: 8px;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    overflow: hidden;
+}
+.id-mode-btn {
+    flex: 1;
+    padding: 5px 8px;
+    font-size: 12px;
+    background: #0d1117;
+    color: #8b949e;
+    border: 0;
+    cursor: pointer;
+}
+.id-mode-btn + .id-mode-btn { border-left: 1px solid #30363d; }
+.id-mode-btn:hover { color: #c9d1d9; }
+.id-mode-btn.active {
+    background: #388bfd26;
+    color: #58a6ff;
+    font-weight: 600;
+}
+.revision-picker { margin-bottom: 8px; }
+.revision-results {
+    list-style: none;
+    max-height: 180px;
+    overflow-y: auto;
+    margin-top: 6px;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    background: #0d1117;
+}
+.revision-results:empty { display: none; }
+.revision-item {
+    padding: 6px 8px;
+    border-bottom: 1px solid #21262d;
+    border-left: 3px solid transparent;
+    cursor: pointer;
+    font-size: 12px;
+}
+.revision-item:last-child { border-bottom: 0; }
+.revision-item:hover { background: #161b22; }
+.revision-item.selected {
+    background: #388bfd26;
+    border-left-color: #58a6ff;
+}
+.revision-id {
+    font-family: 'Consolas', monospace;
+    color: #e6edf3;
+    font-weight: 600;
+}
+.revision-latest { color: #8b949e; margin-left: 6px; }
+.revision-match {
+    margin-left: 6px;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 10px;
+    background: #3fb95026;
+    color: #3fb950;
+    font-weight: 600;
+}
+.revision-meta {
+    color: #8b949e;
+    font-size: 11px;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.revision-empty {
+    padding: 8px;
+    color: #8b949e;
+    font-size: 12px;
+    font-style: italic;
+}
+.id-mode-note {
+    font-size: 11px;
+    color: #58a6ff;
+    margin-bottom: 8px;
+}
+.id-mode-note.error { color: #f85149; }
+.id-mode-note:empty { display: none; }
+.labels-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+.labels-hint {
+    flex: 1;
+    font-size: 11px;
+    color: #8b949e;
+}
+.labels-hint b { color: #3fb950; font-weight: 600; }
+.labels-row .bulk-btn { flex: 0 0 auto; }
+
 .drawing-info-fields {
     display: flex;
     flex-direction: column;

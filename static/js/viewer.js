@@ -25,11 +25,6 @@ window.viewer = (function () {
         document.body.classList.toggle('select-mode', _activeMode === 'select');
     }
 
-    function rebuildPage(pageNum) {
-        var pe = pageEls[pageNum];
-        if (pe) buildPageOverlay(pageNum, parseFloat(pe.wrapper.dataset.zoom) || 1);
-    }
-
     function addManualBox(pageNum, bbox_pt) {
         const state = window.APP_STATE;
         if (!state.manualBoxes) state.manualBoxes = [];
@@ -53,19 +48,77 @@ window.viewer = (function () {
     }
 
     // ── Custom text boxes (place text anywhere) ──
-    function addTextBox(pageNum, x_pt, y_pt) {
+    // Also used for the Mechximize / Drawing ID labels: text boxes with a
+    // `role` ('company' | 'drawing_id') whose text the app controls.
+    //
+    // Layout mirrors app.py (TEXT_LINE_HEIGHT / TEXT_BASELINE): same font
+    // metrics, same line height, positioned by the top-left of the first line
+    // and wrapped only where the user pressed Enter — so the text lands in the
+    // PDF exactly where it sits in the editor.
+    const TEXT_FONT = 'Arial, Helvetica, sans-serif';
+    const TEXT_LINE_HEIGHT = 1.2;
+    const LABEL_NAMES = { company: 'Company', drawing_id: 'Drawing ID' };
+    let _measureCtx = null;
+
+    function textWidth(text, fontPx) {
+        if (!_measureCtx) _measureCtx = document.createElement('canvas').getContext('2d');
+        _measureCtx.font = fontPx + 'px ' + TEXT_FONT;
+        return _measureCtx.measureText(text).width;
+    }
+
+    // Displayed px per PDF point on a page.
+    function pageScale(pageNum) {
+        const pe = pageEls[pageNum];
+        const zoom = pe ? (parseFloat(pe.wrapper.dataset.zoom) || 1) : 1;
+        return (window.APP_STATE.renderScale || (150 / 72)) * zoom;
+    }
+
+    function textBoxEl(tb) {
+        const pe = pageEls[tb.page];
+        return pe ? pe.overlay.querySelector('[data-tb-id="' + tb.id + '"]') : null;
+    }
+
+    // Position and size a text box element from its state. Updates in place
+    // (no rebuild), so an edit in progress keeps its focus and caret.
+    function layoutTextBox(tEl, tb) {
+        const s = pageScale(tb.page);
+        const ta = tEl.querySelector('.text-box-input');
+        const fontPx = tb.fontsize * s;
+        tEl.style.left = (tb.x_pt * s) + 'px';
+        tEl.style.top = (tb.y_pt * s) + 'px';
+        ta.style.fontSize = fontPx + 'px';
+        const lines = (ta.value || ta.placeholder).split('\n');
+        let w = 0;
+        lines.forEach(function (line) { w = Math.max(w, textWidth(line, fontPx)); });
+        // Slack for the caret, so a line never scrolls sideways out of view.
+        ta.style.width = Math.ceil(w + Math.max(4, fontPx * 0.4)) + 'px';
+        ta.style.height = Math.ceil(lines.length * fontPx * TEXT_LINE_HEIGHT) + 'px';
+    }
+
+    function notifyTextChange() {
+        if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
+    }
+
+    // opts: { role, text, fontsize, focus }. New plain text boxes get focus
+    // so the user can type immediately.
+    function addTextBox(pageNum, x_pt, y_pt, opts) {
+        opts = opts || {};
         const state = window.APP_STATE;
         if (!state.textBoxes) state.textBoxes = [];
-        const id = 'tb_' + pageNum + '_' + (_tbCounter++);
-        state.textBoxes.push({ id: id, page: pageNum, x_pt: x_pt, y_pt: y_pt, text: '', fontsize: 14 });
-        rebuildPage(pageNum);
-        if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
-        // Focus the fresh input so the user can type immediately.
+        const tb = {
+            id: 'tb_' + pageNum + '_' + (_tbCounter++), page: pageNum,
+            x_pt: x_pt, y_pt: y_pt, text: opts.text || '', fontsize: opts.fontsize || 14,
+        };
+        if (opts.role) tb.role = opts.role;
+        state.textBoxes.push(tb);
         const pe = pageEls[pageNum];
-        if (pe) {
-            const el = pe.overlay.querySelector('[data-tb-id="' + id + '"] .text-box-input');
-            if (el) el.focus();
+        if (pe && pe.loaded) {   // unloaded pages build their boxes on load
+            const tEl = buildTextBox(tb);
+            pe.overlay.appendChild(tEl);
+            if (opts.focus !== false) tEl.querySelector('.text-box-input').focus();
         }
+        notifyTextChange();
+        return tb;
     }
 
     function removeTextBox(id) {
@@ -73,38 +126,160 @@ window.viewer = (function () {
         if (!state.textBoxes) return;
         const idx = state.textBoxes.findIndex(function (t) { return t.id === id; });
         if (idx < 0) return;
-        const pageNum = state.textBoxes[idx].page;
+        const tEl = textBoxEl(state.textBoxes[idx]);
         state.textBoxes.splice(idx, 1);
-        rebuildPage(pageNum);
-        if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
+        if (tEl) tEl.remove();
+        notifyTextChange();
     }
 
-    // Drag a text box by its grip handle (updates x_pt/y_pt in PDF points).
-    function attachTextDrag(handle, tb, pageNum) {
-        handle.addEventListener('mousedown', function (e) {
-            e.preventDefault(); e.stopPropagation();
-            const pe = pageEls[pageNum];
-            const zoom = parseFloat(pe.wrapper.dataset.zoom) || 1;
-            const scale = (window.APP_STATE.renderScale) || (150 / 72);
-            const f = 1 / (scale * zoom);
+    // Re-sync an existing text box element after its state changed.
+    function updateTextBox(tb) {
+        const tEl = textBoxEl(tb);
+        if (!tEl) return;
+        const ta = tEl.querySelector('.text-box-input');
+        if (ta.value !== (tb.text || '')) ta.value = tb.text || '';
+        layoutTextBox(tEl, tb);
+    }
+
+    // Move a text box, possibly to another page.
+    function placeTextBox(tb, pageNum, x_pt, y_pt, fontsize) {
+        const oldEl = textBoxEl(tb);
+        const pageChanged = tb.page !== pageNum;
+        tb.page = pageNum;
+        tb.x_pt = x_pt;
+        tb.y_pt = y_pt;
+        if (fontsize) tb.fontsize = fontsize;
+        if (!pageChanged) {
+            if (oldEl) layoutTextBox(oldEl, tb);
+            return;
+        }
+        if (oldEl) oldEl.remove();
+        const pe = pageEls[pageNum];
+        if (pe && pe.loaded) pe.overlay.appendChild(buildTextBox(tb));
+    }
+
+    // Drag a text box with any pointer (mouse, touch, pen); updates x_pt/y_pt
+    // in PDF points, clamped to the page. A press that doesn't move calls
+    // onTap instead.
+    function attachTextDrag(handle, tb, onTap) {
+        // Keep focus where it is (don't steal it from the text being edited).
+        handle.addEventListener('mousedown', function (e) { e.preventDefault(); e.stopPropagation(); });
+        handle.addEventListener('pointerdown', function (e) {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const s = pageScale(tb.page);
+            const dims = (window.APP_STATE.pageDims || {})[String(tb.page)];
             const startX = e.clientX, startY = e.clientY;
             const origX = tb.x_pt, origY = tb.y_pt;
-            const tEl = pe.overlay.querySelector('[data-tb-id="' + tb.id + '"]');
+            const tEl = handle.closest('.text-box');
+            let moved = false;
+            try { handle.setPointerCapture(e.pointerId); } catch (_) { /* old browsers */ }
+            tEl.classList.add('text-box-dragging');
             function move(ev) {
-                tb.x_pt = Math.max(0, origX + (ev.clientX - startX) * f);
-                tb.y_pt = Math.max(0, origY + (ev.clientY - startY) * f);
-                if (tEl) {
-                    tEl.style.left = (tb.x_pt * scale * zoom) + 'px';
-                    tEl.style.top = (tb.y_pt * scale * zoom) + 'px';
+                const dx = ev.clientX - startX, dy = ev.clientY - startY;
+                if (!moved && Math.abs(dx) + Math.abs(dy) < 3) return;  // jitter, not a drag
+                moved = true;
+                let x = origX + dx / s, y = origY + dy / s;
+                if (dims) {
+                    x = Math.min(x, dims.width_pt - 4);
+                    y = Math.min(y, dims.height_pt - 4);
                 }
+                tb.x_pt = Math.max(0, x);
+                tb.y_pt = Math.max(0, y);
+                tEl.style.left = (tb.x_pt * s) + 'px';
+                tEl.style.top = (tb.y_pt * s) + 'px';
             }
             function up() {
-                document.removeEventListener('mousemove', move);
-                document.removeEventListener('mouseup', up);
+                handle.removeEventListener('pointermove', move);
+                handle.removeEventListener('pointerup', up);
+                handle.removeEventListener('pointercancel', up);
+                tEl.classList.remove('text-box-dragging');
+                if (moved) tb.moved = true;   // user-placed: auto-placement leaves it alone
+                else if (onTap) onTap();
             }
-            document.addEventListener('mousemove', move);
-            document.addEventListener('mouseup', up);
+            handle.addEventListener('pointermove', move);
+            handle.addEventListener('pointerup', up);
+            handle.addEventListener('pointercancel', up);
         });
+    }
+
+    function buildTextBox(tb) {
+        const tEl = document.createElement('div');
+        tEl.className = 'text-box' + (tb.role ? ' text-box-label' : '');
+        tEl.dataset.tbId = tb.id;
+
+        // A textarea, not an <input>: Enter / Shift+Enter start a new line and
+        // every normal editing key (Shift+arrows, Ctrl+A/C/V/Z, Home/End…) works.
+        const ta = document.createElement('textarea');
+        ta.className = 'text-box-input';
+        ta.rows = 1;
+        ta.setAttribute('wrap', 'off');   // lines break only where Enter was pressed, as in the PDF
+        ta.spellcheck = false;
+        ta.value = tb.text || '';
+        ta.placeholder = 'type text…';
+        ta.addEventListener('input', function () {
+            tb.text = ta.value;
+            layoutTextBox(tEl, tb);
+            notifyTextChange();
+        });
+        ta.addEventListener('keydown', function (e) {
+            e.stopPropagation();          // keys belong to the text, not page navigation
+            if (e.key === 'Escape') ta.blur();
+        });
+        ta.addEventListener('focus', function () { tEl.classList.add('text-box-active'); });
+        ta.addEventListener('blur', function () { tEl.classList.remove('text-box-active'); });
+        ta.addEventListener('click', function (e) { e.stopPropagation(); });
+        if (tb.role) {
+            // Labels show app-controlled text: drag them anywhere by the body;
+            // a tap selects them (shows the toolbar).
+            ta.readOnly = true;
+            ta.title = LABEL_NAMES[tb.role] + ' — drag to position';
+            attachTextDrag(ta, tb, function () { ta.focus(); });
+        } else {
+            ta.addEventListener('mousedown', function (e) { e.stopPropagation(); });
+        }
+
+        // Floating toolbar (grip / font− font+ / delete), shown on hover or
+        // while the box is selected.
+        const bar = document.createElement('div');
+        bar.className = 'text-box-bar';
+        const mkBtn = function (txt, title, fn) {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'text-box-btn';
+            b.textContent = txt;
+            b.title = title;
+            // mousedown default would move focus off the text being edited.
+            b.addEventListener('mousedown', function (e) { e.preventDefault(); e.stopPropagation(); });
+            b.addEventListener('click', function (e) { e.stopPropagation(); fn(); });
+            return b;
+        };
+        const grip = mkBtn('✥', 'Drag to move', function () {});
+        grip.classList.add('text-box-grip');
+        attachTextDrag(grip, tb, function () { ta.focus(); });
+        bar.appendChild(grip);
+        if (tb.role) {
+            const tag = document.createElement('span');
+            tag.className = 'text-box-tag';
+            tag.textContent = LABEL_NAMES[tb.role];
+            bar.appendChild(tag);
+        }
+        bar.appendChild(mkBtn('A−', 'Smaller', function () {
+            tb.fontsize = Math.max(4, tb.fontsize - (tb.fontsize > 8 ? 2 : 1));
+            layoutTextBox(tEl, tb);
+        }));
+        bar.appendChild(mkBtn('A+', 'Larger', function () {
+            tb.fontsize = Math.min(96, tb.fontsize + (tb.fontsize >= 8 ? 2 : 1));
+            layoutTextBox(tEl, tb);
+        }));
+        bar.appendChild(mkBtn('×', tb.role ? 'Remove label (Auto-place brings it back)' : 'Delete',
+            function () { removeTextBox(tb.id); }));
+
+        tEl.appendChild(bar);
+        tEl.appendChild(ta);
+        layoutTextBox(tEl, tb);
+        return tEl;
     }
 
     /**
@@ -402,6 +577,15 @@ window.viewer = (function () {
         const pe = pageEls[pageNum];
         if (!pe) return;
 
+        // A rebuild replaces the text box elements. Carry an edit in progress
+        // (focus + caret) across it — otherwise any refresh, or a touch
+        // keyboard resizing the viewport, throws the user out mid-typing.
+        const active = document.activeElement;
+        let editing = null;
+        if (active && active.classList.contains('text-box-input') && pe.overlay.contains(active)) {
+            editing = { id: active.parentNode.dataset.tbId, start: active.selectionStart, end: active.selectionEnd };
+        }
+
         pe.overlay.innerHTML = '';
         pe.bboxEls = {};
 
@@ -488,59 +672,18 @@ window.viewer = (function () {
             pe.overlay.appendChild(mdiv);
         });
 
-        // Custom text boxes (black Helvetica text placed anywhere)
-        var tboxes = (state.textBoxes || []).filter(function (t) { return t.page === pageNum; });
-        tboxes.forEach(function (tb) {
-            var tEl = document.createElement('div');
-            tEl.className = 'text-box';
-            tEl.dataset.tbId = tb.id;
-            tEl.style.left = (tb.x_pt * scale * zoom) + 'px';
-            tEl.style.top  = (tb.y_pt * scale * zoom) + 'px';
-
-            var fontPx = Math.max(6, tb.fontsize * scale * zoom);
-
-            var input = document.createElement('input');
-            input.className = 'text-box-input';
-            input.value = tb.text || '';
-            input.placeholder = 'type text…';
-            input.style.fontSize = fontPx + 'px';
-            var sizeInput = function () {
-                var len = input.value.length || input.placeholder.length;
-                input.style.width = Math.max(40, (len + 1) * fontPx * 0.58) + 'px';
-            };
-            sizeInput();
-            input.addEventListener('input', function () {
-                tb.text = input.value;
-                sizeInput();
-                if (window.sync && window.sync.updateRedactCount) window.sync.updateRedactCount();
-            });
-            input.addEventListener('mousedown', function (e) { e.stopPropagation(); });
-            input.addEventListener('click', function (e) { e.stopPropagation(); });
-
-            // Floating toolbar (grip / font− font+ / delete), shown on hover/focus
-            var bar = document.createElement('div');
-            bar.className = 'text-box-bar';
-            var mkBtn = function (txt, title, fn) {
-                var b = document.createElement('button');
-                b.className = 'text-box-btn';
-                b.textContent = txt; b.title = title;
-                b.addEventListener('mousedown', function (e) { e.stopPropagation(); });
-                b.addEventListener('click', function (e) { e.stopPropagation(); fn(); });
-                return b;
-            };
-            var grip = document.createElement('button');
-            grip.className = 'text-box-btn text-box-grip';
-            grip.textContent = '✥'; grip.title = 'Drag to move';
-            attachTextDrag(grip, tb, pageNum);
-            bar.appendChild(grip);
-            bar.appendChild(mkBtn('A−', 'Smaller', function () { tb.fontsize = Math.max(6, tb.fontsize - 2); rebuildPage(pageNum); }));
-            bar.appendChild(mkBtn('A+', 'Larger', function () { tb.fontsize = Math.min(96, tb.fontsize + 2); rebuildPage(pageNum); }));
-            bar.appendChild(mkBtn('×', 'Delete', function () { removeTextBox(tb.id); }));
-
-            tEl.appendChild(bar);
-            tEl.appendChild(input);
-            pe.overlay.appendChild(tEl);
+        // Custom text boxes + labels (black Helvetica text placed anywhere)
+        (state.textBoxes || []).forEach(function (tb) {
+            if (tb.page === pageNum) pe.overlay.appendChild(buildTextBox(tb));
         });
+
+        if (editing) {
+            var ta = pe.overlay.querySelector('[data-tb-id="' + editing.id + '"] .text-box-input');
+            if (ta) {
+                ta.focus({ preventScroll: true });
+                try { ta.setSelectionRange(editing.start, editing.end); } catch (_) { /* readonly */ }
+            }
+        }
     }
 
     /**
@@ -602,6 +745,9 @@ window.viewer = (function () {
             var img = pe.img;
             if (!img.naturalWidth) return;
             var zoom = Math.max(0.05, Math.min(1, availWidth / img.naturalWidth));
+            // Height-only viewport changes (e.g. a touch keyboard opening while
+            // a text box is edited) leave the fit unchanged — don't rebuild.
+            if (Math.abs(zoom - parseFloat(pe.wrapper.dataset.zoom)) < 1e-4) return;
             pe.wrapper.dataset.zoom = zoom;
             img.style.width = (img.naturalWidth * zoom) + 'px';
             img.style.height = (img.naturalHeight * zoom) + 'px';
@@ -651,5 +797,7 @@ window.viewer = (function () {
         removeManualBox: removeManualBox,
         addTextBox: addTextBox,
         removeTextBox: removeTextBox,
+        updateTextBox: updateTextBox,
+        placeTextBox: placeTextBox,
     };
 })();
