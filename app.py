@@ -7,6 +7,7 @@ import uuid
 import math
 import zipfile
 import hashlib
+import threading
 import concurrent.futures
 
 
@@ -44,7 +45,7 @@ from werkzeug.utils import secure_filename
 from pii_patterns import scan_pii
 from sheets_integration import (
     generate_drawing_id, append_or_update_drawing_row,
-    list_drawing_rows, split_revision, next_revision_id,
+    list_drawing_rows, split_revision, next_revision_id, next_fresh_id,
 )
 
 
@@ -1084,7 +1085,7 @@ def _known_drawings(max_age=60):
         _log(f"[DRAWINGS] sheet read failed: {sheet_error}")
 
     store_rows = []
-    for sv in DRAWING_STORE.values():
+    for sv in list(DRAWING_STORE.values()):  # snapshot: Process adds entries concurrently
         meta = sv.get("metadata") or {}
         store_rows.append({
             "drawing_id": sv.get("drawing_id") or "",
@@ -1162,11 +1163,12 @@ def assign_drawing_id(file_id):
 
     mode "new":      a fresh sequential ID (or the fresh ID this exact
                      drawing already has).
-    mode "revision": the next revision of base_id (or the revision of that
-                     base this exact drawing was already recorded as).
+    mode "revision": the next free revision of base_id — always a new one,
+                     even when this exact file was recorded as an earlier
+                     revision (picking a drawing means "record a revision").
 
     Like extract-metadata, nothing is reserved here: the ID is claimed when
-    Process writes its row to the Sheet.
+    Process writes its row to the Sheet (see _claim_drawing_id).
     """
     info = FILE_REGISTRY.get(file_id)
     if not info:
@@ -1174,21 +1176,18 @@ def assign_drawing_id(file_id):
 
     data = request.get_json(silent=True) or {}
     stored_id = (DRAWING_STORE.get(info.get("hash")) or {}).get("drawing_id") or ""
-    stored_base, stored_rev = split_revision(stored_id)
+    _, stored_rev = split_revision(stored_id)
 
     try:
         if data.get("mode") == "revision":
             base, _ = split_revision(data.get("base_id"))
             if not _DRAWING_ID_RE.match(base) or base == "DI_ERROR":
                 return jsonify({"error": "invalid base Drawing ID"}), 400
-            if stored_rev and stored_base == base:
-                drawing_id = stored_id
-            else:
-                # Fresh read: a stale list could hand out a taken revision.
-                groups, sheet_error = _known_drawings(max_age=0)
-                if sheet_error:
-                    raise RuntimeError(f"Google Sheet unavailable ({sheet_error})")
-                drawing_id = next_revision_id(base, groups.get(base, {}).get("ids", ()))
+            # Fresh read: a stale list could hand out a taken revision.
+            groups, sheet_error = _known_drawings(max_age=0)
+            if sheet_error:
+                raise RuntimeError(f"Google Sheet unavailable ({sheet_error})")
+            drawing_id = next_revision_id(base, groups.get(base, {}).get("ids", ()))
         elif stored_id and not stored_rev and stored_id != "DI_ERROR":
             drawing_id = stored_id
         else:
@@ -1258,6 +1257,32 @@ def _flatten_monster_images(doc, page, mp_threshold, dpi=200):
     return removed == len(big)
 
 
+# Offered Drawing IDs (extract-metadata / drawing-id) aren't reserved, so two
+# files open at once can be offered the same one. Process claims it for real:
+# under this lock it checks the ID is still free and writes the Sheet row, so
+# the second file moves on to the next free ID instead of overwriting the
+# first one's row (and both PDFs carrying the same ID).
+_CLAIM_LOCK = threading.Lock()
+
+
+def _claim_drawing_id(drawing_id, file_hash):
+    """drawing_id if this file may take it, else the next free ID of the same
+    kind: the next revision of the same base, or the next fresh ID.
+
+    Call with _CLAIM_LOCK held, and record the claim before releasing it.
+    """
+    own = (DRAWING_STORE.get(file_hash) or {}).get("drawing_id") if file_hash else None
+    if drawing_id == own:
+        return drawing_id  # reprocessing: this file already holds it
+    taken = {r["drawing_id"] for r in list_drawing_rows(max_age=0)}
+    # list(): a snapshot — other requests add entries concurrently.
+    taken |= {sv.get("drawing_id") for h, sv in list(DRAWING_STORE.items()) if h != file_hash}
+    if drawing_id not in taken:
+        return drawing_id
+    base, rev = split_revision(drawing_id)
+    return next_revision_id(base, taken) if rev else next_fresh_id(taken)
+
+
 @app.route("/api/redact/<file_id>", methods=["POST"])
 def redact(file_id):
     info = FILE_REGISTRY.get(file_id)
@@ -1283,6 +1308,36 @@ def redact(file_id):
     has_text = any(str(t.get("text", "")).strip() for t in text_boxes)
     if not redact_blocks and not manual_boxes and not has_text:
         return jsonify({"error": "nothing to apply"}), 400
+
+    # Step 0: Claim the Drawing ID and write it to Google Sheets (idempotent —
+    # updates this ID's row on reprocess instead of duplicating it) BEFORE
+    # anything is stamped with it: the ID may change if another drawing took
+    # it since it was offered.
+    sheets_error = None
+    h = info.get("hash")
+    if has_id:
+        with _CLAIM_LOCK:
+            offered_id = drawing_id
+            try:
+                drawing_id = _claim_drawing_id(drawing_id, h)
+            except Exception as e:
+                _log(f"[CLAIM] could not check {drawing_id}, using it as offered: {e}")
+            if drawing_id != offered_id:
+                _log(f"[CLAIM] {offered_id} was taken meanwhile; using {drawing_id}")
+            try:
+                append_or_update_drawing_row(
+                    drawing_id=drawing_id,
+                    company_name=metadata.get("client_name", ""),
+                    original_part_id=metadata.get("original_part_id", ""),
+                    part_name=metadata.get("part_name", ""),
+                    quantity=metadata.get("quantity", "1"),
+                    material=metadata.get("material", ""),
+                )
+            except Exception as e:
+                sheets_error = str(e)[:100]
+            if h:
+                # Hold the claim locally too (covers a failed Sheet write).
+                DRAWING_STORE.setdefault(h, {})["drawing_id"] = drawing_id
 
     output_path = os.path.join(
         app.config["OUTPUT_FOLDER"], f"{file_id}_redacted.pdf"
@@ -1463,22 +1518,6 @@ def redact(file_id):
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
 
-    # Step 3: Write to Google Sheets (idempotent — updates the existing row for
-    # this Drawing ID on reprocess instead of duplicating it).
-    sheets_error = None
-    if has_id:
-        try:
-            append_or_update_drawing_row(
-                drawing_id=drawing_id,
-                company_name=metadata.get("client_name", ""),
-                original_part_id=metadata.get("original_part_id", ""),
-                part_name=metadata.get("part_name", ""),
-                quantity=metadata.get("quantity", "1"),
-                material=metadata.get("material", ""),
-            )
-        except Exception as e:
-            sheets_error = str(e)[:100]
-
     # Mark redacted (for batch status / Download All) and store the drawing_id
     # for the download filename.
     FILE_REGISTRY[file_id]["redacted"] = True
@@ -1488,7 +1527,6 @@ def redact(file_id):
 
     # Step 4: Persist editing state keyed by content hash, so reopening this
     # exact drawing later restores its Drawing ID + prior selections.
-    h = info.get("hash")
     if h and has_id:
         DRAWING_STORE[h] = {
             "drawing_id": drawing_id,

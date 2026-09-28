@@ -52,17 +52,20 @@ def generate_drawing_id():
     Reads column D (Assigned Part Name) to find the current max sequence
     for the current month/year prefix, then returns the next one.
     """
+    sheet = _get_sheet()
+    return next_fresh_id(sheet.col_values(4))  # Column D
+
+
+def next_fresh_id(existing_ids):
+    """The next DIMMYY#### for the current month, given every ID in use."""
     now = datetime.now()
     mm = f"{now.month:02d}"
     yy = f"{now.year % 100:02d}"
     prefix = f"DI{mm}{yy}"  # e.g. "DI0326" for March 2026
 
-    sheet = _get_sheet()
-    assigned_col = sheet.col_values(4)  # Column D
-
     pattern = re.compile(rf"^{prefix}(\d{{4}})$")
     max_seq = 0
-    for val in assigned_col:
+    for val in existing_ids:
         m = pattern.match(str(val).strip())
         if m:
             seq = int(m.group(1))
@@ -80,7 +83,8 @@ def generate_drawing_id():
 # and Z are skipped (easily misread as 1, 0, 5, 2), and after Y come AA, AB...
 # No dot in the suffix, so "DI04260012-RevA.pdf" has a single extension.
 REV_ALPHABET = "ABCDEFGHJKLMNPRTUVWY"
-_REV_RE = re.compile(r"^(?P<base>.+)-Rev(?P<rev>[A-Z]{1,3})$")
+# Also accepts hand-typed variants in the sheet: "-REVB", "-revb", "-Rev B".
+_REV_RE = re.compile(r"^(?P<base>.*?\S)\s*-\s*rev\s*(?P<rev>[a-z]{1,3})$", re.IGNORECASE)
 
 
 def split_revision(drawing_id):
@@ -88,8 +92,14 @@ def split_revision(drawing_id):
     s = str(drawing_id or "").strip()
     m = _REV_RE.match(s)
     if m:
-        return m.group("base"), m.group("rev")
+        return m.group("base"), m.group("rev").upper()
     return s, ""
+
+
+def canonical_drawing_id(drawing_id):
+    """'DI04260012-rev b' -> 'DI04260012-RevB' (the form this tool writes)."""
+    base, rev = split_revision(drawing_id)
+    return f"{base}-Rev{rev}" if rev else base
 
 
 def _rev_to_index(rev):
@@ -138,7 +148,7 @@ def list_drawing_rows(max_age=60):
     rows = []
     for r in _get_sheet().get_all_values():
         r = list(r) + [""] * (8 - len(r))
-        drawing_id = str(r[3]).strip()
+        drawing_id = canonical_drawing_id(r[3])
         if not drawing_id or " " in drawing_id:  # blank, or the header row
             continue
         rows.append({
