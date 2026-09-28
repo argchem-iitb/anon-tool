@@ -26,6 +26,7 @@
         freshDrawingId: null,     // the fresh ID offered in 'new' mode
         revisionBase: null,       // base Drawing ID picked in 'revision' mode
         revisionDrawingId: null,  // the revision ID assigned for revisionBase
+        idChosen: false,          // the user picked a mode / drawing in this session
         labelsInit: false,        // Mechximize / Drawing ID labels placed once already
         metadata: null,
         metadataExtracted: false,
@@ -408,14 +409,18 @@
     }
 
     // An ID the server resolved for this drawing (extracted, or reopened).
-    // A revision ID means this exact file was recorded as that revision.
+    // A revision ID means this exact file was recorded as that revision —
+    // unless the user already chose otherwise this session (e.g. picked a
+    // drawing to record a NEW revision); a re-extraction must not undo that.
     function adoptDrawingId(id) {
         var p = parseDrawingId(id);
         if (p.rev) {
-            state.idMode = 'revision';
-            state.revisionBase = p.base;
-            state.revisionDrawingId = id;
-            if (!_searchResults.length) runRevisionSearch();   // picker is visible: fill it
+            if (!state.idChosen) {
+                state.idMode = 'revision';
+                state.revisionBase = p.base;
+                state.revisionDrawingId = id;
+                if (!_searchResults.length) runRevisionSearch();   // picker is visible: fill it
+            }
         } else {
             state.freshDrawingId = id;
         }
@@ -449,6 +454,7 @@
         // Re-clicking "New" after a failed generation (DI_ERROR) retries it.
         if (mode === state.idMode && !(mode === 'new' && state.drawingId === 'DI_ERROR')) return;
         state.idMode = mode;
+        state.idChosen = true;
         if (mode === 'revision') {
             applyDrawingId(state.revisionDrawingId);
             if (!state.revisionDrawingId) revisionSearch.focus();
@@ -473,6 +479,7 @@
     });
 
     async function pickRevision(r) {
+        state.idChosen = true;
         state.revisionBase = r.base_id;
         state.revisionDrawingId = null;
         applyDrawingId(null);
@@ -748,6 +755,15 @@
             var msg = totalMasks + ' change(s) applied successfully.';
             if (data.drawing_id) {
                 msg += ' Drawing ID: ' + data.drawing_id;
+            }
+            if (data.drawing_id && payload.drawing_id && data.drawing_id !== payload.drawing_id) {
+                // Another drawing was processed with the offered ID first, so
+                // the server moved this one to the next free ID (the PDF and
+                // the Sheet row carry the new one).
+                if (parseDrawingId(data.drawing_id).rev) state.revisionDrawingId = data.drawing_id;
+                else state.freshDrawingId = data.drawing_id;
+                applyDrawingId(data.drawing_id);
+                msg += '\n' + payload.drawing_id + ' was taken by another drawing in the meantime, so this one is ' + data.drawing_id + '.';
             }
             if (data.sheets_error) {
                 msg += ' (Sheets sync error: ' + data.sheets_error + ')';
