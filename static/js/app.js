@@ -415,6 +415,7 @@
             state.idMode = 'revision';
             state.revisionBase = p.base;
             state.revisionDrawingId = id;
+            if (!_searchResults.length) runRevisionSearch();   // picker is visible: fill it
         } else {
             state.freshDrawingId = id;
         }
@@ -494,6 +495,12 @@
     var _searchTimer = null, _searchSeq = 0, _searchResults = [];
     async function runRevisionSearch() {
         var seq = ++_searchSeq;
+        // Reading the Sheet can take a few seconds: never leave the list blank.
+        revisionResults.classList.add('loading');
+        if (!_searchResults.length) {
+            revisionResults.innerHTML = '';
+            addResultNote('Loading drawings from the Google Sheet…');
+        }
         var params = new URLSearchParams({
             q: revisionSearch.value.trim(),
             // Drawings with this file's part no. are listed first.
@@ -509,6 +516,8 @@
             _searchResults = [];
             revisionResults.innerHTML = '';
             addResultNote('Search failed: ' + err.message);
+        } finally {
+            if (seq === _searchSeq) revisionResults.classList.remove('loading');
         }
     }
 

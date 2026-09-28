@@ -450,15 +450,19 @@ body.select-mode .page-drawlayer {
 }
 .bulk-btn:hover { border-color: #f85149; color: #f85149; }
 
-/* ── Block list ── */
-#block-list {
-    list-style: none;
-    overflow-y: auto;
+/* ── Sidebar body: Drawing Info panel + block list, one scroll area ── */
+#sidebar-body {
     flex: 1 1 auto;
     min-height: 0;                  /* critical: scroll internally instead of
                                        overflowing the sidebar off-screen */
+    overflow-y: auto;
     overscroll-behavior: contain;
     -webkit-overflow-scrolling: touch;
+}
+
+/* ── Block list ── */
+#block-list {
+    list-style: none;
 }
 .block-item {
     padding: 10px 12px;
@@ -611,9 +615,6 @@ body.select-mode .page-drawlayer {
     padding: 12px;
     border-bottom: 1px solid #30363d;
     background: #1c2128;
-    flex-shrink: 0;        /* don't get squeezed by the list... */
-    max-height: 50%;       /* ...but never eat more than half the sidebar */
-    overflow-y: auto;      /* scroll within itself if cramped */
 }
 .drawing-info-header {
     display: flex;
@@ -668,6 +669,7 @@ body.select-mode .page-drawlayer {
     background: #0d1117;
 }
 .revision-results:empty { display: none; }
+.revision-results.loading .revision-item { opacity: 0.55; }
 .revision-item {
     padding: 6px 8px;
     border-bottom: 1px solid #21262d;
