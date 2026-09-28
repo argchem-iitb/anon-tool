@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import shutil
 import uuid
@@ -41,7 +42,10 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 from pii_patterns import scan_pii
-from sheets_integration import generate_drawing_id, append_or_update_drawing_row
+from sheets_integration import (
+    generate_drawing_id, append_or_update_drawing_row,
+    list_drawing_rows, split_revision, next_revision_id,
+)
 
 
 def _log(msg):
@@ -58,6 +62,17 @@ app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB (ZIP batches)
 
 RENDER_DPI = 150
 SCALE = RENDER_DPI / 72.0
+
+# Text boxes (and the Mechximize / Drawing ID labels) are laid out the same
+# way in the editor and in the PDF: Helvetica, lines 1.2 x fontsize apart,
+# first baseline 0.95 x fontsize below the box top (Arial/Helvetica metrics
+# at that line height). viewer.js and main.css mirror these values.
+TEXT_LINE_HEIGHT = 1.2
+TEXT_BASELINE = 0.95
+COMPANY_LABEL = "Mechximize"
+
+# Drawing IDs end up in filenames, the PDF and the Sheet: keep them plain.
+_DRAWING_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 # Ensure storage dirs exist at import time (gunicorn imports the module,
 # so this must not live only under __main__).
@@ -492,35 +507,50 @@ Here are the text blocks from the title block:
     raise ValueError(f"Could not parse Gemini metadata response: {raw[:200]}")
 
 
-def _overlay_new_labels(doc, redact_blocks, drawing_id, scan_blocks=None, metadata=None):
-    """Overlay 'Mechximize' in the TITLE value field and Drawing ID in the DRG. NO. value field.
+def _suggest_label_positions(anchors, drawing_id, scan_blocks=None, metadata=None):
+    """Suggest where the 'Mechximize' and Drawing ID labels should START.
 
-    Strategy: Use metadata text to find the exact removed blocks that held
-    the title value and drawing number value, then place overlay text there.
+    The user drags the labels into their final place in the editor and the
+    PDF gets them exactly there; this only picks a sensible first spot.
+    anchors are the redacted blocks ({id, page, bbox_pt}) plus manual masks
+    ({page, bbox_pt}), in VISIBLE coords.
+
+    Strategy: the removed block that held the title / drawing-number value
+    (matched by metadata text), else the removed value nearest the TITLE /
+    DRG. NO. label, else the centre of the redacted title-block area.
+
+    Returns {"company": pos, "drawing_id": pos} with pos = {page, x_pt, y_pt,
+    fontsize}; (x_pt, y_pt) is the top-left of the text, the same space and
+    convention as text boxes. Empty when there is nothing to anchor to.
     """
+    if not anchors:
+        return {}
     page_counts = {}
-    for bl in redact_blocks:
+    for bl in anchors:
         page_counts[bl["page"]] = page_counts.get(bl["page"], 0) + 1
     title_page_num = max(page_counts, key=page_counts.get)
-    page = doc[title_page_num]
 
-    redact_ids = {bl["id"] for bl in redact_blocks if bl["page"] == title_page_num}
+    redact_ids = {bl["id"] for bl in anchors
+                  if bl.get("id") and bl["page"] == title_page_num}
     page_scan_blocks = [b for b in (scan_blocks or []) if b["page"] == title_page_num]
 
     fontname = "helv"
-    color_black = (0, 0, 0)
-    # Bboxes here are VISIBLE coords; insert_text works in unrotated space, so
-    # derotate each point and rotate the glyphs to stay upright on rotated pages.
-    derot = page.derotation_matrix
-    prot = page.rotation
+    label_text = {"company": COMPANY_LABEL, "drawing_id": drawing_id}
+    label_size = {"company": 12, "drawing_id": 10}
+    placed = {}
 
-    def _put_text(px, py, text, fontsize):
-        p = fitz.Point(px, py) * derot
-        page.insert_text(p, text, fontsize=fontsize, fontname=fontname,
-                         color=color_black, rotate=prot)
+    def _put(role, px, py, fontsize):
+        # (px, py) is the baseline start; text boxes are positioned by top.
+        placed[role] = {
+            "page": title_page_num,
+            "x_pt": round(max(0.0, px), 2),
+            "y_pt": round(max(0.0, py - fontsize * TEXT_BASELINE), 2),
+            "fontsize": round(fontsize, 2),
+        }
 
-    def _place_text_in_bbox(bbox, text, fontsize):
-        """Place text centered inside a bbox (visible coords)."""
+    def _place_in_bbox(role, bbox):
+        """Center the label inside a bbox (visible coords), shrinking to fit."""
+        text, fontsize = label_text[role], label_size[role]
         x0, y0, x1, y1 = bbox
         box_w = x1 - x0
         box_h = y1 - y0
@@ -531,7 +561,7 @@ def _overlay_new_labels(doc, redact_blocks, drawing_id, scan_blocks=None, metada
             tw = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
         px = x0 + (box_w - tw) / 2
         py = y0 + (box_h + fontsize) / 2
-        _put_text(px, py, text, fontsize)
+        _put(role, px, py, fontsize)
 
     def _find_removed_block_by_text(search_text):
         """Find a removed block containing the given text."""
@@ -543,28 +573,22 @@ def _overlay_new_labels(doc, redact_blocks, drawing_id, scan_blocks=None, metada
                 return b
         return None
 
-    placed_company = False
-    placed_id = False
     meta = metadata or {}
 
     # --- Strategy 1: Match by metadata text content (most reliable) ---
 
-    # Place "Mechximize" where the title value was
-    part_name = meta.get("part_name", "")
-    title_block = _find_removed_block_by_text(part_name)
+    # "Mechximize" where the title value was
+    title_block = _find_removed_block_by_text(meta.get("part_name", ""))
     if title_block:
-        _place_text_in_bbox(title_block["bbox_pt"], "Mechximize", 12)
-        placed_company = True
+        _place_in_bbox("company", title_block["bbox_pt"])
 
-    # Place Drawing ID where the original part ID / drawing number was
-    original_id = meta.get("original_part_id", "")
-    drg_block = _find_removed_block_by_text(original_id)
+    # Drawing ID where the original part ID / drawing number was
+    drg_block = _find_removed_block_by_text(meta.get("original_part_id", ""))
     if drg_block:
-        _place_text_in_bbox(drg_block["bbox_pt"], drawing_id, 10)
-        placed_id = True
+        _place_in_bbox("drawing_id", drg_block["bbox_pt"])
 
     # --- Strategy 2: Fallback — use label proximity with directional bias ---
-    if not placed_company or not placed_id:
+    if len(placed) < 2:
         def _find_label(keywords):
             for b in page_scan_blocks:
                 txt = b["text"].upper()
@@ -594,39 +618,37 @@ def _overlay_new_labels(doc, redact_blocks, drawing_id, scan_blocks=None, metada
 
         used_ids = set()
 
-        if not placed_company:
+        if "company" not in placed:
             title_label = _find_label(["TITLE"])
             if title_label:
                 val = _find_value_below_label(title_label, used_ids)
                 if val:
-                    _place_text_in_bbox(val["bbox_pt"], "Mechximize", 12)
+                    _place_in_bbox("company", val["bbox_pt"])
                     used_ids.add(val["id"])
-                    placed_company = True
 
-        if not placed_id:
+        if "drawing_id" not in placed:
             drg_label = _find_label(["DRG. NO", "DRG NO", "DRG.NO", "DRAWING NO"])
             if drg_label:
                 val = _find_value_below_label(drg_label, used_ids)
                 if val:
-                    _place_text_in_bbox(val["bbox_pt"], drawing_id, 10)
-                    placed_id = True
+                    _place_in_bbox("drawing_id", val["bbox_pt"])
 
     # --- Strategy 3: Last resort fallback — center of title block area ---
-    if not placed_company or not placed_id:
-        page_bboxes = [bl["bbox_pt"] for bl in redact_blocks if bl["page"] == title_page_num]
-        if page_bboxes:
-            tb_x0 = min(bb[0] for bb in page_bboxes)
-            tb_y0 = min(bb[1] for bb in page_bboxes)
-            tb_x1 = max(bb[2] for bb in page_bboxes)
-            tb_y1 = max(bb[3] for bb in page_bboxes)
-            cx = (tb_x0 + tb_x1) / 2
-            cy = (tb_y0 + tb_y1) / 2
-            if not placed_company:
-                tw = fitz.get_text_length("Mechximize", fontname=fontname, fontsize=12)
-                _put_text(cx - tw / 2, cy - 5, "Mechximize", 12)
-            if not placed_id:
-                tw = fitz.get_text_length(drawing_id, fontname=fontname, fontsize=10)
-                _put_text(cx - tw / 2, cy + 12, drawing_id, 10)
+    if len(placed) < 2:
+        page_bboxes = [bl["bbox_pt"] for bl in anchors if bl["page"] == title_page_num]
+        tb_x0 = min(bb[0] for bb in page_bboxes)
+        tb_y0 = min(bb[1] for bb in page_bboxes)
+        tb_x1 = max(bb[2] for bb in page_bboxes)
+        tb_y1 = max(bb[3] for bb in page_bboxes)
+        cx = (tb_x0 + tb_x1) / 2
+        cy = (tb_y0 + tb_y1) / 2
+        for role, dy in (("company", -5), ("drawing_id", 12)):
+            if role not in placed:
+                fs = label_size[role]
+                tw = fitz.get_text_length(label_text[role], fontname=fontname, fontsize=fs)
+                _put(role, cx - tw / 2, cy + dy, fs)
+
+    return placed
 
 
 # ──────────────────────────── pages ────────────────────────────
@@ -1015,6 +1037,171 @@ def extract_metadata(file_id):
     })
 
 
+@app.route("/api/suggest-labels/<file_id>", methods=["POST"])
+def suggest_labels(file_id):
+    """Starting positions for the draggable Mechximize / Drawing ID labels."""
+    info = FILE_REGISTRY.get(file_id)
+    if not info:
+        return jsonify({"error": "not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    block_ids = set(data.get("block_ids", []))
+
+    blocks = SCAN_CACHE.get(file_id)
+    if not blocks:
+        _, _, blocks = _extract_blocks(info["path"])
+        SCAN_CACHE[file_id] = blocks
+
+    anchors = [b for b in blocks if b["id"] in block_ids]
+    for mb in data.get("manual_boxes", []):
+        try:
+            bbox = [float(v) for v in mb["bbox_pt"]]
+            if len(bbox) == 4:
+                anchors.append({"page": int(mb["page"]), "bbox_pt": bbox})
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    # Size the Drawing ID label for a typical ID while none is chosen yet.
+    drawing_id = str(data.get("drawing_id") or "") or "DI00000000"
+    labels = _suggest_label_positions(anchors, drawing_id, scan_blocks=blocks,
+                                      metadata=data.get("metadata") or {})
+    return jsonify({"labels": labels})
+
+
+def _known_drawings(max_age=60):
+    """Every Drawing ID in use — the Google Sheet plus this server's drawing
+    store — grouped by base ID (a base and all its revisions).
+
+    Returns (groups, sheet_error): groups maps base_id -> {base_id, client,
+    part_id, part_name, ids}. sheet_error is set when the Sheet couldn't be
+    read (groups then hold only locally known drawings).
+    """
+    sheet_rows, sheet_error = [], None
+    try:
+        sheet_rows = list_drawing_rows(max_age=max_age)
+    except Exception as e:
+        sheet_error = f"{type(e).__name__}: {e}"
+        _log(f"[DRAWINGS] sheet read failed: {sheet_error}")
+
+    store_rows = []
+    for sv in DRAWING_STORE.values():
+        meta = sv.get("metadata") or {}
+        store_rows.append({
+            "drawing_id": sv.get("drawing_id") or "",
+            "client": meta.get("client_name") or "",
+            "part_id": meta.get("original_part_id") or "",
+            "part_name": meta.get("part_name") or "",
+        })
+
+    groups = {}
+    for from_sheet, rows in ((True, sheet_rows), (False, store_rows)):
+        for r in rows:
+            did = str(r.get("drawing_id") or "").strip()
+            if did == "DI_ERROR" or not _DRAWING_ID_RE.match(did):
+                continue
+            base, rev = split_revision(did)
+            g = groups.setdefault(base, {"base_id": base, "client": "", "part_id": "",
+                                         "part_name": "", "ids": set()})
+            g["ids"].add(did)
+            for k in ("client", "part_id", "part_name"):
+                v = str(r.get(k) or "").strip()
+                # The Sheet wins over the local store (people edit it), and
+                # the base drawing's row wins over its revisions' rows.
+                if v and (not g[k] or (from_sheet and not rev)):
+                    g[k] = v
+    return groups, sheet_error
+
+
+def _norm_part_id(s):
+    return re.sub(r"[\s\-_./]", "", str(s or "")).lower()
+
+
+def _drawing_id_recency(base_id):
+    """Sort key: DIMMYY#### -> (yy, mm, seq); anything else sorts last."""
+    m = re.match(r"^DI(\d{2})(\d{2})(\d+)$", base_id)
+    return (int(m.group(2)), int(m.group(1)), int(m.group(3))) if m else (-1, 0, 0)
+
+
+@app.route("/api/drawings/search")
+def search_drawings():
+    """Find existing drawings to record a revision against.
+
+    q filters on Drawing ID / client / part no. / part name; hint (the part
+    no. extracted from this drawing) floats same-part drawings to the top.
+    """
+    q = (request.args.get("q") or "").strip().lower()
+    hint = _norm_part_id(request.args.get("hint"))
+    groups, sheet_error = _known_drawings()
+
+    results = []
+    for g in groups.values():
+        haystack = " ".join([g["base_id"], g["client"], g["part_id"], g["part_name"]]).lower()
+        if q and q not in haystack:
+            continue
+        revs = sorted((split_revision(i)[1] for i in g["ids"] if split_revision(i)[1]),
+                      key=lambda r: (len(r), r))
+        results.append({
+            "base_id": g["base_id"],
+            "client": g["client"],
+            "part_id": g["part_id"],
+            "part_name": g["part_name"],
+            "revisions": revs,
+            "latest_id": f"{g['base_id']}-Rev{revs[-1]}" if revs else g["base_id"],
+            "match": bool(hint) and _norm_part_id(g["part_id"]) == hint,
+        })
+
+    # Newest first, then same-part matches ahead of everything (stable sort).
+    results.sort(key=lambda r: _drawing_id_recency(r["base_id"]), reverse=True)
+    results.sort(key=lambda r: not r["match"])
+    return jsonify({"results": results[:30], "sheet_error": sheet_error})
+
+
+@app.route("/api/drawing-id/<file_id>", methods=["POST"])
+def assign_drawing_id(file_id):
+    """Resolve this file's Drawing ID for the chosen mode.
+
+    mode "new":      a fresh sequential ID (or the fresh ID this exact
+                     drawing already has).
+    mode "revision": the next revision of base_id (or the revision of that
+                     base this exact drawing was already recorded as).
+
+    Like extract-metadata, nothing is reserved here: the ID is claimed when
+    Process writes its row to the Sheet.
+    """
+    info = FILE_REGISTRY.get(file_id)
+    if not info:
+        return jsonify({"error": "not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    stored_id = (DRAWING_STORE.get(info.get("hash")) or {}).get("drawing_id") or ""
+    stored_base, stored_rev = split_revision(stored_id)
+
+    try:
+        if data.get("mode") == "revision":
+            base, _ = split_revision(data.get("base_id"))
+            if not _DRAWING_ID_RE.match(base) or base == "DI_ERROR":
+                return jsonify({"error": "invalid base Drawing ID"}), 400
+            if stored_rev and stored_base == base:
+                drawing_id = stored_id
+            else:
+                # Fresh read: a stale list could hand out a taken revision.
+                groups, sheet_error = _known_drawings(max_age=0)
+                if sheet_error:
+                    raise RuntimeError(f"Google Sheet unavailable ({sheet_error})")
+                drawing_id = next_revision_id(base, groups.get(base, {}).get("ids", ()))
+        elif stored_id and not stored_rev and stored_id != "DI_ERROR":
+            drawing_id = stored_id
+        else:
+            drawing_id = generate_drawing_id()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        _log(f"[DRAWING_ID] ERROR: {err}")
+        return jsonify({"error": err[:200]}), 502
+
+    _log(f"[DRAWING_ID] {data.get('mode') or 'new'} -> {drawing_id} for {file_id}")
+    return jsonify({"drawing_id": drawing_id})
+
+
 def _flatten_monster_images(doc, page, mp_threshold, dpi=200):
     """Truly scrub oversized rasters on an already-redacted page.
 
@@ -1081,8 +1268,12 @@ def redact(file_id):
     redact_blocks = data.get("blocks", [])
     manual_boxes = data.get("manual_boxes", [])
     text_boxes = data.get("text_boxes", [])
-    drawing_id = data.get("drawing_id", "")
+    drawing_id = str(data.get("drawing_id") or "")
     metadata = data.get("metadata", {})
+
+    if drawing_id and not _DRAWING_ID_RE.match(drawing_id):
+        return jsonify({"error": "invalid Drawing ID"}), 400
+    has_id = bool(drawing_id) and drawing_id != "DI_ERROR"
 
     # Debug: log what metadata we received
     _log(f"[REDACT] file_id={file_id}, drawing_id={drawing_id}")
@@ -1190,21 +1381,22 @@ def redact(file_id):
         except Exception:
             pass
 
-    # Step 2: Overlay "Mechximize" + Drawing ID on the title block.
-    # Requires detected title-block text blocks to anchor to — skipped when
-    # only manual masks were applied.
-    if drawing_id and drawing_id != "DI_ERROR" and redact_blocks:
-        scan_blocks = SCAN_CACHE.get(file_id)
-        if not scan_blocks:
-            _, _, scan_blocks = _extract_blocks(info["path"])
-            SCAN_CACHE[file_id] = scan_blocks
-        _overlay_new_labels(doc, redact_blocks, drawing_id,
-                            scan_blocks=scan_blocks, metadata=metadata)
-
-    # Step 2.5: Place custom user text boxes (black Helvetica, on top of all).
+    # Step 2: Place text boxes (black Helvetica, on top of all) — the user's
+    # own text plus the Mechximize / Drawing ID labels ("role"), each exactly
+    # where it sits in the editor. Nothing is auto-placed here: the user
+    # drags the labels into position before processing.
     for tb in text_boxes:
-        txt = str(tb.get("text", "")).strip()
-        if not txt:
+        role = tb.get("role")
+        if role == "drawing_id":
+            if not has_id:
+                continue
+            txt = drawing_id          # the authoritative ID, never stale client text
+        elif role == "company":
+            txt = COMPANY_LABEL
+        else:
+            txt = str(tb.get("text", "")).replace("\r\n", "\n").replace("\r", "\n")
+            txt = txt.replace("\t", "    ")  # helv has no tab glyph
+        if not txt.strip():
             continue
         try:
             pg = int(tb.get("page", 0))
@@ -1214,13 +1406,14 @@ def redact(file_id):
             x = float(tb.get("x_pt", 0))
             y = float(tb.get("y_pt", 0))
             page = doc[pg]
-            # (x, y) is the VISIBLE text top (matching the editor); insert_text
-            # anchors at the baseline, so drop by ~cap height. Derotate the point
-            # and rotate the glyphs so text stays upright on rotated pages.
-            p_un = fitz.Point(x, y + fs * 0.85) * page.derotation_matrix
+            # (x, y) is the VISIBLE top-left of the box (matching the editor);
+            # insert_text anchors the first line at its baseline and steps
+            # later lines by the same line height the editor uses. Derotate the
+            # point and rotate the glyphs so text stays upright on rotated pages.
+            p_un = fitz.Point(x, y + fs * TEXT_BASELINE) * page.derotation_matrix
             page.insert_text(
-                p_un, txt, fontsize=fs, fontname="helv", color=(0, 0, 0),
-                rotate=page.rotation,
+                p_un, txt, fontsize=fs, lineheight=TEXT_LINE_HEIGHT,
+                fontname="helv", color=(0, 0, 0), rotate=page.rotation,
             )
         except Exception as e:
             _log(f"[TEXTBOX] place failed: {e}")
@@ -1273,7 +1466,7 @@ def redact(file_id):
     # Step 3: Write to Google Sheets (idempotent — updates the existing row for
     # this Drawing ID on reprocess instead of duplicating it).
     sheets_error = None
-    if drawing_id and drawing_id != "DI_ERROR":
+    if has_id:
         try:
             append_or_update_drawing_row(
                 drawing_id=drawing_id,
@@ -1289,20 +1482,23 @@ def redact(file_id):
     # Mark redacted (for batch status / Download All) and store the drawing_id
     # for the download filename.
     FILE_REGISTRY[file_id]["redacted"] = True
-    if drawing_id and drawing_id != "DI_ERROR":
+    if has_id:
         FILE_REGISTRY[file_id]["drawing_id"] = drawing_id
     _save_registry()
 
     # Step 4: Persist editing state keyed by content hash, so reopening this
     # exact drawing later restores its Drawing ID + prior selections.
     h = info.get("hash")
-    if h and drawing_id and drawing_id != "DI_ERROR":
+    if h and has_id:
         DRAWING_STORE[h] = {
             "drawing_id": drawing_id,
             "metadata": metadata,
             "redact_block_ids": [bl.get("id") for bl in redact_blocks if bl.get("id")],
             "manual_boxes": manual_boxes,
             "text_boxes": text_boxes,
+            # Labels were positioned by the user (even if later deleted), so
+            # reopening must not auto-place them again.
+            "labels_placed": bool(data.get("labels_placed")),
             "filename": info.get("filename", ""),
         }
         _save_drawing_store()

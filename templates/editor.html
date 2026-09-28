@@ -70,6 +70,20 @@
                     <span>Drawing Information</span>
                     <span id="drawing-id-badge" class="drawing-id-badge"></span>
                 </div>
+                <div class="id-mode" role="group" aria-label="Drawing ID type">
+                    <button type="button" class="id-mode-btn active" data-mode="new">New Drawing ID</button>
+                    <button type="button" class="id-mode-btn" data-mode="revision">Revision of existing</button>
+                </div>
+                <div id="revision-picker" class="revision-picker hidden">
+                    <input type="search" id="revision-search" class="meta-input" autocomplete="off"
+                           placeholder="Search Drawing ID, part no., client…">
+                    <ul id="revision-results" class="revision-results"></ul>
+                </div>
+                <div id="id-mode-note" class="id-mode-note"></div>
+                <div class="labels-row">
+                    <span class="labels-hint">Drag the <b>Mechximize</b> and <b>Drawing ID</b> labels on the drawing to position them.</span>
+                    <button type="button" id="autoPlaceLabels" class="bulk-btn" title="Move both labels back to the suggested spot (re-adds a removed label)">Auto-place</button>
+                </div>
                 <div class="drawing-info-fields">
                     <label>Client Name
                         <input type="text" id="meta-client" class="meta-input" readonly placeholder="Extracted from drawing...">
