@@ -250,13 +250,13 @@ def _extract_blocks(filepath):
                 # skip black / white / grayscale fills (technical drawing strokes)
                 if max(abs(r - g), abs(g - b), abs(r - b)) < 0.08:
                     continue
-                rect = d.get("rect")
-                if rect is None or rect.is_empty or rect.is_infinite:
+                drect = d.get("rect")
+                if drect is None or drect.is_empty or drect.is_infinite:
                     continue
-                w, h = rect.width, rect.height
+                w, h = drect.width, drect.height
                 if w < 0.3 or h < 0.3 or w > 200 or h > 200:
                     continue
-                colored_rects.append(rect)
+                colored_rects.append(drect)
 
             # cluster nearby colored rects (within 8pt) into bounding regions
             clusters = []
@@ -304,6 +304,12 @@ def _extract_blocks(filepath):
                 continue
             r = fitz.Rect(b["bbox"])
             if r.is_empty or r.is_infinite:
+                continue
+            # A few-pixel image is a solid tint or an invisible placeholder
+            # (exporters stretch transparent 1x1 images over whole views) —
+            # nothing to redact, but listing it put a huge selectable box
+            # over the drawing.
+            if b.get("width", 0) * b.get("height", 0) <= 4:
                 continue
             # Skip full-page background/template rasters (many CAD exports
             # draw one under every sheet). Listing them made any selection
@@ -1201,6 +1207,48 @@ def assign_drawing_id(file_id):
     return jsonify({"drawing_id": drawing_id})
 
 
+def _vectorize_single_pixel_images(doc, page):
+    """Redraw 1x1-pixel images as the solid fill they really are.
+
+    CAD/PDF exporters stretch 1x1 images over large areas as tints or
+    invisible placeholders (e.g. a fully transparent one over all the drawing
+    views). Pixel redaction blanks every image pixel a box touches — for a
+    1x1 image that is the whole area — and loses its transparency: one small
+    mask inside the views turned them solid black. An equivalent vector fill
+    (same colour, same opacity; nothing at all if fully transparent) looks
+    identical, and redaction only removes it if a box covers it completely.
+    Converts the image object in place, so every use of it changes alike.
+    """
+    for im in page.get_images(full=True):
+        xref, smask, w, h = im[0], im[1], im[2], im[3]
+        if w != 1 or h != 1:
+            continue
+        try:
+            if doc.xref_get_key(xref, "ImageMask")[1] == "true":
+                continue  # stencil mask: its colour comes from the content stream
+            alpha = 255
+            if smask:
+                mask = fitz.Pixmap(doc, smask)
+                if mask.width != 1 or mask.height != 1:
+                    continue
+                alpha = mask.pixel(0, 0)[0]
+            pix = fitz.Pixmap(doc, xref)
+            if pix.alpha:
+                pix = fitz.Pixmap(pix, 0)
+            if pix.n not in (1, 3, 4):
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            comps = " ".join(f"{v / 255:.4f}" for v in pix.pixel(0, 0)[:pix.n])
+            op = {1: "g", 3: "rg", 4: "k"}[pix.n]
+            content = f"/A gs {comps} {op} 0 0 1 1 re f" if alpha else "% fully transparent"
+            # Image space is the unit square, so a form with BBox [0 0 1 1]
+            # drawn with the same CTM covers exactly the same area.
+            doc.update_object(xref, "<</Type/XObject/Subtype/Form/BBox[0 0 1 1]"
+                                    f"/Resources<</ExtGState<</A<</ca {alpha / 255:.4f}>>>>>>>>")
+            doc.update_stream(xref, content.encode())
+        except Exception as e:
+            _log(f"[REDACT] could not vectorize 1x1 image xref {xref}: {e}")
+
+
 def _flatten_monster_images(doc, page, mp_threshold, dpi=200):
     """Truly scrub oversized rasters on an already-redacted page.
 
@@ -1380,6 +1428,7 @@ def redact(file_id):
     redact_warnings = []
     for page_num, entries in pages_map.items():
         page = doc[page_num]
+        _vectorize_single_pixel_images(doc, page)
         page_rect = page.rect             # visible bounds
         derot = page.derotation_matrix    # visible -> unrotated (identity if rot 0)
         for bbox, pad in entries:
