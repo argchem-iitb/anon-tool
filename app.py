@@ -1423,9 +1423,9 @@ def _flatten_monster_images(doc, page, mp_threshold, dpi=200):
     Directly decoding a 20-40 MP embedded image (~60-130 MB RGB) OOM-kills the
     512 MB Render instance. Rendering the PAGE instead is memory-safe (MuPDF
     subsample-decodes JPEGs when drawing scaled), so: render the page with its
-    white redaction fills baked in, delete the monster image objects, and put
-    the render underneath the remaining (vector) content. Returns True when
-    every monster on the page was removed.
+    white redaction fills baked in, delete the monster image objects, and lay
+    the render over the page. Returns True when every monster on the page was
+    removed.
     """
     big = []
     for im in page.get_images(full=True):
@@ -1463,9 +1463,11 @@ def _flatten_monster_images(doc, page, mp_threshold, dpi=200):
         except Exception as e:
             _log(f"[FLATTEN] delete xref {xref} failed: {e}")
     if removed:
-        # Underlay the flattened render; surviving vector content (already
-        # redacted) draws on top of it, visually unchanged.
-        page.insert_image(page.rect, stream=flat_jpg, overlay=False)
+        # The render already shows everything visible (redactions baked in),
+        # so it goes ON TOP. Underneath it was hidden by any opaque background
+        # drawn first — Canva pages start with a full-page white rectangle —
+        # which wiped every line of such drawings and left only their text.
+        page.insert_image(page.rect, stream=flat_jpg, overlay=True)
     try:
         fitz.TOOLS.store_shrink(100)
     except Exception:
