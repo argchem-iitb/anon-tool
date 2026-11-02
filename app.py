@@ -6,8 +6,12 @@ import shutil
 import uuid
 import math
 import zipfile
+import glob
+import time
+import ctypes
 import hashlib
 import threading
+import collections
 import concurrent.futures
 
 
@@ -160,8 +164,46 @@ def _save_drawing_store():
 
 DRAWING_STORE = _load_drawing_store()
 
-# SCAN_CACHE is rebuildable from the PDF on demand — no need to persist.
-SCAN_CACHE = {}
+# SCAN_CACHE is rebuildable from the PDF on demand — no need to persist, and
+# no need to keep it for every file ever opened: a dense pack is megabytes of
+# blocks, and an unbounded cache grew the worker ~2 MB per file until the
+# 512 MB instance was killed. Only the most recently used files are kept.
+_SCAN_CACHE_MAX = 8
+SCAN_CACHE = collections.OrderedDict()
+_SCAN_LOCK = threading.Lock()
+
+
+def _cache_blocks(file_id, blocks):
+    with _SCAN_LOCK:
+        SCAN_CACHE[file_id] = blocks
+        SCAN_CACHE.move_to_end(file_id)
+        while len(SCAN_CACHE) > _SCAN_CACHE_MAX:
+            SCAN_CACHE.popitem(last=False)
+
+
+def _scan_blocks(file_id, info):
+    """A file's blocks: from the cache, else re-extracted from its PDF."""
+    with _SCAN_LOCK:
+        blocks = SCAN_CACHE.get(file_id)
+        if blocks is not None:
+            SCAN_CACHE.move_to_end(file_id)
+            return blocks
+    _, _, blocks = _extract_blocks(info["path"])
+    _cache_blocks(file_id, blocks)
+    return blocks
+
+
+# ── Give memory back to the system after PDF work ──
+# Rendering and redacting allocate large short-lived buffers. Freed memory
+# stays inside the process by default, so the worker's RAM only ever grew
+# (what Render's memory graph shows). Each of the 8 request threads also gets
+# its own C heap, multiplying that waste; two heaps are plenty here.
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+    _libc.mallopt(-8, 2)  # M_ARENA_MAX
+except (OSError, AttributeError):
+    _libc = None  # not glibc (e.g. a Windows dev machine)
+_last_release = [0.0]
 
 
 # ──────────────────────────── helpers ──────────────────────────
@@ -658,6 +700,144 @@ def _suggest_label_positions(anchors, drawing_id, scan_blocks=None, metadata=Non
     return placed
 
 
+@app.after_request
+def _release_memory(response):
+    """After PDF work, empty MuPDF's resource cache and hand freed heap back
+    to the OS (at most once a second, so bursts of page loads stay cheap)."""
+    if request.path.startswith(("/api/", "/upload", "/download")) and time.time() - _last_release[0] > 1.0:
+        _last_release[0] = time.time()
+        try:
+            fitz.TOOLS.store_shrink(100)
+        except Exception:
+            pass
+        if _libc is not None:
+            _libc.malloc_trim(0)
+    return response
+
+
+# ── Automatic cleanup of old files ──
+# Uploads, processed PDFs and rendered page images are only needed while
+# someone works on a drawing; left alone they pile up on the instance's disk.
+# Drawings untouched for FILE_RETENTION_HOURS lose their files (and registry
+# entries); the per-drawing memory that restores a reopened drawing's Drawing
+# ID and edits is forgotten after DRAWING_RETENTION_DAYS without changes.
+# The Google Sheet is never touched. Runs at most hourly, off the request.
+FILE_RETENTION_HOURS = float(os.environ.get("FILE_RETENTION_HOURS", "48"))
+DRAWING_RETENTION_DAYS = float(os.environ.get("DRAWING_RETENTION_DAYS", "30"))
+_CLEANUP_INTERVAL = 3600
+_cleanup_lock = threading.Lock()
+_last_cleanup = [0.0]
+_last_touch = {}  # file_id -> when its upload's mtime was last refreshed
+
+
+def _mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except (OSError, TypeError):
+        return 0.0
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def _mark_in_use(file_id):
+    """Refresh a drawing's last-used time (its upload's mtime) so cleanup
+    never removes work in progress. Throttled to one touch per 10 minutes."""
+    info = FILE_REGISTRY.get(file_id)
+    now = time.time()
+    if info and now - _last_touch.get(file_id, 0) > 600:
+        _last_touch[file_id] = now
+        try:
+            os.utime(info["path"])
+        except OSError:
+            pass
+
+
+def _cleanup_old_files():
+    if not _cleanup_lock.acquire(blocking=False):
+        return
+    try:
+        now = time.time()
+        file_cutoff = now - FILE_RETENTION_HOURS * 3600
+        out = app.config["OUTPUT_FOLDER"]
+        cache_dir = os.path.join(out, "_pagecache")
+        removed_files = 0
+
+        expired = [fid for fid, info in list(FILE_REGISTRY.items())
+                   if max(_mtime(info.get("path")),
+                          _mtime(os.path.join(out, f"{fid}_redacted.pdf"))) < file_cutoff]
+        for fid in expired:
+            info = FILE_REGISTRY.pop(fid, None) or {}
+            for path in [info.get("path"), os.path.join(out, f"{fid}_redacted.pdf"),
+                         *glob.glob(os.path.join(cache_dir, f"{fid}_p*.png"))]:
+                removed_files += bool(path) and _remove(path)
+            with _SCAN_LOCK:
+                SCAN_CACHE.pop(fid, None)
+            _last_touch.pop(fid, None)
+
+        # Stray files no registry entry points at (e.g. left by a restart
+        # mid-write): <id>.pdf, <id>_redacted.pdf, <id>_p<N>.png, *.tmp
+        strays = (glob.glob(os.path.join(app.config["UPLOAD_FOLDER"], "*.pdf"))
+                  + glob.glob(os.path.join(out, "*.pdf"))
+                  + glob.glob(os.path.join(cache_dir, "*.png"))
+                  + glob.glob(os.path.join(cache_dir, "*.tmp")))
+        for path in strays:
+            fid = os.path.basename(path).split("_")[0].split(".")[0]
+            if fid not in FILE_REGISTRY and _mtime(path) < file_cutoff:
+                removed_files += _remove(path)
+
+        # Batches drop deleted files; a batch with none left goes too.
+        batches_changed = False
+        for bid, batch in list(BATCH_REGISTRY.items()):
+            keep = [f for f in batch.get("file_ids", []) if f in FILE_REGISTRY]
+            if not keep:
+                BATCH_REGISTRY.pop(bid, None)
+                batches_changed = True
+            elif len(keep) != len(batch.get("file_ids", [])):
+                batch["file_ids"] = keep
+                batches_changed = True
+
+        drawing_cutoff = now - DRAWING_RETENTION_DAYS * 86400
+        forgotten = 0
+        for h, sv in list(DRAWING_STORE.items()):
+            if not sv.get("updated_at"):
+                sv["updated_at"] = now  # saved before this existed: start its clock now
+            elif sv["updated_at"] < drawing_cutoff:
+                DRAWING_STORE.pop(h, None)
+                forgotten += 1
+
+        if expired:
+            _save_registry()
+        if batches_changed:
+            _save_batch_registry()
+        _save_drawing_store()
+        if expired or removed_files or forgotten:
+            _log(f"[CLEANUP] {len(expired)} idle drawing(s) removed ({removed_files} files), "
+                 f"{forgotten} saved drawing(s) forgotten")
+    except Exception as e:
+        _log(f"[CLEANUP] failed: {e}")
+    finally:
+        _cleanup_lock.release()
+
+
+@app.before_request
+def _housekeeping():
+    file_id = (request.view_args or {}).get("file_id")
+    if file_id:
+        _mark_in_use(file_id)
+    elif request.endpoint == "batch_view":
+        for fid in BATCH_REGISTRY.get(request.view_args["batch_id"], {}).get("file_ids", []):
+            _mark_in_use(fid)
+    if time.time() - _last_cleanup[0] > _CLEANUP_INTERVAL:
+        _last_cleanup[0] = time.time()
+        threading.Thread(target=_cleanup_old_files, daemon=True).start()
+
+
 # ──────────────────────────── pages ────────────────────────────
 
 def _hash_file(path):
@@ -860,7 +1040,7 @@ def scan(file_id):
         return jsonify({"error": "not found"}), 404
 
     total_pages, page_dims, blocks = _extract_blocks(info["path"])
-    SCAN_CACHE[file_id] = blocks
+    _cache_blocks(file_id, blocks)
 
     # Prior work for this exact drawing (by content hash), if any.
     h = info.get("hash")
@@ -922,11 +1102,7 @@ def analyze(file_id):
     if not info:
         return jsonify({"error": "not found"}), 404
 
-    blocks = SCAN_CACHE.get(file_id)
-    if not blocks:
-        _, _, blocks = _extract_blocks(info["path"])
-        SCAN_CACHE[file_id] = blocks
-
+    blocks = _scan_blocks(file_id, info)
     context_objects = _build_context_objects(blocks)
 
     # Batch into chunks of 15 to stay within token limits, and run batches
@@ -965,11 +1141,7 @@ def extract_metadata(file_id):
     data = request.get_json()
     block_ids = set(data.get("block_ids", []))
 
-    blocks = SCAN_CACHE.get(file_id)
-    if not blocks:
-        # Cache lost (worker restart) — rebuild from disk
-        _, _, blocks = _extract_blocks(info["path"])
-        SCAN_CACHE[file_id] = blocks
+    blocks = _scan_blocks(file_id, info)
     removed_blocks = [b for b in blocks if b["id"] in block_ids and not b.get("is_image")]
 
     # Extract metadata via Gemini
@@ -1054,11 +1226,7 @@ def suggest_labels(file_id):
     data = request.get_json(silent=True) or {}
     block_ids = set(data.get("block_ids", []))
 
-    blocks = SCAN_CACHE.get(file_id)
-    if not blocks:
-        _, _, blocks = _extract_blocks(info["path"])
-        SCAN_CACHE[file_id] = blocks
-
+    blocks = _scan_blocks(file_id, info)
     anchors = [b for b in blocks if b["id"] in block_ids]
     for mb in data.get("manual_boxes", []):
         try:
@@ -1586,6 +1754,7 @@ def redact(file_id):
             # Labels were positioned by the user (even if later deleted), so
             # reopening must not auto-place them again.
             "labels_placed": bool(data.get("labels_placed")),
+            "updated_at": time.time(),   # for automatic cleanup
             "filename": info.get("filename", ""),
         }
         _save_drawing_store()
